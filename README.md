@@ -78,6 +78,7 @@ Each time after that: **Start VR** → put the headset on → WiVRn → play →
 |---|---|
 | Game says *OpenXR runtime not found* | The launch options are missing or wrong. Copy them again from the Setup tab. WiVRn's own suggestion (`PRESSURE_VESSEL_IMPORT_OPENXR_1_RUNTIMES=1`) wasn't enough with the Flatpak. |
 | **Beat Saber pauses itself** and re-pauses as soon as you resume | Include `OXR_PARALLEL_VIEWS=0` in the launch options (already in the copied text). |
+| Headset says *waiting for an app* but the game list is empty | WiVRn is a Flatpak and can't see Steam libraries on other drives. Use **Let WiVRn see them** on the Setup tab, or run `flatpak override --user --filesystem=/path/to/SteamLibrary:ro io.github.wivrn.wivrn`, then restart the WiVRn server. Restart Steam after installing new games. |
 | No game sound in the headset | Turn on "Switch sound output to the headset", or press **Send audio to headset**. |
 | PC doesn't appear in the headset list | Check the firewall line on the Setup tab and that Avahi is running. |
 | Picture is blurry | Raise the bitrate in **Open WiVRn settings** (around 100 Mbit/s works well on 5 GHz) and the resolution scale in the headset app. Adjust the headset's IPD slider and fit too. |

@@ -187,6 +187,48 @@ def steam_kind():
     return None
 
 
+def steam_libraries():
+    """Steam library folders listed in libraryfolders.vdf."""
+    import re
+    paths = []
+    for base in ("~/.steam/steam", "~/.local/share/Steam",
+                 "~/.var/app/com.valvesoftware.Steam/data/Steam"):
+        f = os.path.expanduser(base + "/steamapps/libraryfolders.vdf")
+        try:
+            with open(f) as fh:
+                paths += re.findall(r'"path"\s+"([^"]+)"', fh.read())
+        except OSError:
+            pass
+    return list(dict.fromkeys(os.path.realpath(p) for p in paths))
+
+
+def wivrn_hidden_libraries():
+    """Steam libraries the WiVRn Flatpak can't read, so their games don't show up in the
+    headset's game list (it only gets ~/.steam and ~/.local/share/Steam by default)."""
+    home = os.path.realpath(os.path.expanduser("~"))
+    allowed = [os.path.join(home, ".steam"), os.path.join(home, ".local/share/Steam"),
+               os.path.join(home, ".var/app/com.valvesoftware.Steam")]
+    rc, out = run(["flatpak", "override", "--user", "--show", WIVRN_APP])
+    for line in out.splitlines():
+        if line.startswith("filesystems="):
+            allowed += [os.path.realpath(os.path.expanduser(x.split(":")[0]))
+                        for x in line.split("=", 1)[1].split(";") if x.startswith(("/", "~"))]
+    rc, out = run(["flatpak", "info", "--show-permissions", WIVRN_APP])
+    for line in out.splitlines():
+        if line.startswith("filesystems="):
+            for x in line.split("=", 1)[1].split(";"):
+                x = x.split(":")[0]
+                if x in ("host", "home"):   # host-os / host-etc are system dirs only
+                    allowed.append(home if x == "home" else "/")
+                elif x.startswith(("/", "~")):
+                    allowed.append(os.path.realpath(os.path.expanduser(x)))
+    hidden = []
+    for lib in steam_libraries():
+        if not any(lib == a or lib.startswith(a.rstrip("/") + "/") for a in allowed):
+            hidden.append(lib)
+    return hidden
+
+
 def steam_launch_options():
     m = wivrn_manifest()
     if not m:
@@ -476,6 +518,14 @@ def run_checks(settings):
             "(native Steam is simpler).", ("link", "WiVRn docs", WIVRN_URL))
     else:
         add("Steam", WARN, "Not found (only needed for Steam games).")
+    if where:
+        hidden = wivrn_hidden_libraries()
+        if hidden:
+            add("Games visible in the headset", BAD, "WiVRn can't see these Steam libraries, so "
+                "their games won't be in the headset's game list: " + ", ".join(hidden),
+                ("action", "Let WiVRn see them", "allow_libraries"))
+        elif sk:
+            add("Games visible in the headset", OK, "WiVRn can read all your Steam libraries.")
     opts = steam_launch_options()
     if opts:
         add("Steam launch options", INFO, "Paste into each VR game: Properties → Launch Options.",
@@ -767,6 +817,14 @@ class VRControl(Gtk.ApplicationWindow):
     def do_fix(self, key, btn):
         if key == "create_hotspot":
             self.create_hotspot()
+            return
+        if key == "allow_libraries":
+            for lib in wivrn_hidden_libraries():
+                run(["flatpak", "override", "--user", f"--filesystem={lib}:ro", WIVRN_APP])
+            if self.wivrn.running():
+                self.toast("Done. Restart the WiVRn server (switch it off and on) for the "
+                           "games to appear in the headset.")
+            self.refresh_checks()
             return
         cmds = {
             "add_flathub": ["flatpak", "remote-add", "--user", "--if-not-exists", "flathub",
