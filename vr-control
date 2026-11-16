@@ -12,7 +12,9 @@ https://github.com/Pxl-Box/vr-control
 """
 import json
 import os
+import re
 import secrets
+import struct
 import shutil
 import string
 import subprocess
@@ -185,6 +187,308 @@ def steam_kind():
     if have("flatpak") and run(["flatpak", "info", "com.valvesoftware.Steam"])[0] == 0:
         return "flatpak"
     return None
+
+
+# ---------------------------------------------------------------- headset game list
+# WiVRn 26.9 builds the headset's game list from <steam>/config/steamapps.vrmanifest, which
+# current Steam no longer writes (fixed in WiVRn after 26.9). VR Control writes that file
+# itself from Steam's app database, so installed VR games appear in the headset.
+MANIFEST_MARK = "written-by-vr-control"
+
+
+def steam_roots():
+    h = os.path.expanduser("~")
+    roots = [os.path.join(h, ".var/app/com.valvesoftware.Steam/.steam/steam")]
+    for r in (os.path.join(h, ".steam/debian-installation"),
+              os.path.join(GLib.get_user_data_dir(), "Steam"),
+              os.path.join(h, ".local/share/Steam")):
+        if os.path.isdir(r):
+            roots.append(r)
+            break
+    return [r for r in roots if os.path.isdir(os.path.join(r, "config"))]
+
+
+def installed_appids(root):
+    try:
+        with open(os.path.join(root, "config/libraryfolders.vdf")) as f:
+            txt = f.read()
+    except OSError:
+        return set()
+    ids = set()
+    for block in re.findall(r'"apps"\s*\{([^}]*)\}', txt):
+        ids |= {int(a) for a in re.findall(r'"(\d+)"\s+"\d+"', block)}
+    return ids
+
+
+def steam_vr_games(root):
+    """[(appid, name)] of installed games flagged openvrsupport in appcache/appinfo.vdf."""
+    wanted = installed_appids(root)
+    try:
+        with open(os.path.join(root, "appcache/appinfo.vdf"), "rb") as f:
+            data = f.read()
+    except OSError:
+        return []
+    magic, _ = struct.unpack_from("<II", data, 0)
+    if magic & 0xFFFFFF00 != 0x07564400:
+        return []
+    pos, table = 8, None
+    if magic & 0xFF >= 41:                       # newer format: keys are string-table indices
+        (off,) = struct.unpack_from("<Q", data, pos)
+        pos += 8
+        (count,) = struct.unpack_from("<I", data, off)
+        p, table = off + 4, []
+        for _ in range(count):
+            e = data.index(b"\0", p)
+            table.append(data[p:e].decode("utf-8", "replace"))
+            p = e + 1
+
+    def cstr(p):
+        e = data.index(b"\0", p)
+        return data[p:e].decode("utf-8", "replace"), e + 1
+
+    def read_dict(p, path, out):
+        while True:
+            t = data[p]
+            p += 1
+            if t == 8:
+                return p
+            if table is not None:
+                key = table[struct.unpack_from("<I", data, p)[0]]
+                p += 4
+            else:
+                key, p = cstr(p)
+            k = path + (key.lower(),)
+            if t == 0:
+                p = read_dict(p, k, out)
+            elif t == 1:
+                out[k], p = cstr(p)
+            elif t == 2:
+                out[k] = struct.unpack_from("<I", data, p)[0]
+                p += 4
+            else:
+                raise ValueError(t)
+
+    games = []
+    while pos + 8 <= len(data):
+        appid, size = struct.unpack_from("<II", data, pos)
+        if appid == 0:
+            break
+        start = pos + 8
+        if appid in wanted:
+            out = {}
+            try:
+                read_dict(start + 4 + 4 + 8 + 20 + 4 + 20 + 4 + 1, (), out)
+                if out.get(("common", "openvrsupport")) not in (None, 0, "0"):
+                    games.append((appid, out.get(("common", "name"), str(appid))))
+            except Exception:  # noqa: BLE001
+                pass
+        pos = start + size
+    return games
+
+
+def sync_headset_game_list():
+    """Write steamapps.vrmanifest for each Steam install. Returns the VR game names."""
+    names = []
+    for root in steam_roots():
+        games = steam_vr_games(root)
+        path = os.path.join(root, "config/steamapps.vrmanifest")
+        try:
+            with open(path) as f:
+                existing = json.load(f)
+        except Exception:  # noqa: BLE001
+            existing = {}
+        apps = [a for a in existing.get("applications", [])
+                if not existing.get(MANIFEST_MARK) or not a.get("app_key", "").startswith("steam.app.")]
+        have_keys = {a.get("app_key") for a in apps}
+        for appid, name in games:
+            if f"steam.app.{appid}" not in have_keys:
+                apps.append({"app_key": f"steam.app.{appid}", "launch_type": "url",
+                             "url": f"steam://launch/{appid}/VR",
+                             "strings": {"en_us": {"name": name}}})
+        new = {MANIFEST_MARK: True, "source": "VR Control (see its README)", "applications": apps}
+        if new != existing:
+            try:
+                with open(path, "w") as f:
+                    json.dump(new, f, indent=2)
+            except OSError:
+                pass
+        names += [n for _, n in games]
+    return names
+
+
+# ---------------------------------------------------------------- per-game launch options
+def vdf_parse(text):
+    """Parse Valve text KeyValues into nested [key, value] lists (order and escapes kept)."""
+    i, n = 0, len(text)
+
+    def skip():
+        nonlocal i
+        while i < n:
+            if text[i] in " \t\r\n":
+                i += 1
+            elif text.startswith("//", i):
+                while i < n and text[i] != "\n":
+                    i += 1
+            else:
+                break
+
+    def string():
+        nonlocal i
+        if text[i] != '"':
+            raise ValueError(f"expected a quote at {i}")
+        i += 1
+        out = []
+        while text[i] != '"':
+            step = 2 if text[i] == "\\" else 1
+            out.append(text[i:i + step])
+            i += step
+        i += 1
+        return "".join(out)
+
+    def block():
+        nonlocal i
+        items = []
+        while True:
+            skip()
+            if i >= n or text[i] == "}":
+                i += 1
+                return items
+            k = string()
+            skip()
+            if text[i] == "{":
+                i += 1
+                items.append([k, block()])
+            else:
+                items.append([k, string()])
+
+    return block()
+
+
+def vdf_dump(items, depth=0):
+    tab, out = "\t" * depth, []
+    for k, v in items:
+        if isinstance(v, list):
+            out.append(f'{tab}"{k}"\n{tab}{{\n{vdf_dump(v, depth + 1)}{tab}}}\n')
+        else:
+            out.append(f'{tab}"{k}"\t\t"{v}"\n')
+    return "".join(out)
+
+
+def vdf_get(items, *path, create=False):
+    for key in path:
+        found = next((kv for kv in items if kv[0].lower() == key.lower()
+                      and isinstance(kv[1], list)), None)
+        if found is None:
+            if not create:
+                return None
+            found = [key, []]
+            items.append(found)
+        items = found[1]
+    return items
+
+
+def localconfigs():
+    for root in steam_roots():
+        ud = os.path.join(root, "userdata")
+        for u in sorted(os.listdir(ud)) if os.path.isdir(ud) else []:
+            f = os.path.join(ud, u, "config/localconfig.vdf")
+            if os.path.isfile(f):
+                yield root, f
+
+
+def wanted_options(existing):
+    """Launch options for a VR game: WiVRn's, keeping any of the user's own game arguments."""
+    opts = steam_launch_options()
+    env = opts.replace(" %command%", "")
+    existing = existing.strip()
+    if not existing or "XR_RUNTIME_JSON=" in existing or "VR_OVERRIDE=" in existing:
+        return opts                                  # empty, or an older VR runtime's options
+    if "%command%" in existing:
+        return f"{env} {existing}"
+    return f"{opts} {existing}"                      # bare game arguments
+
+
+def options_ok(value):
+    m = wivrn_manifest()
+    return bool(m) and f"XR_RUNTIME_JSON={m}" in value and "OXR_PARALLEL_VIEWS=0" in value \
+        and "%command%" in value
+
+
+def launch_option_status():
+    """(games already set, games missing) by name, for installed VR games."""
+    done, missing = [], []
+    for root, f in localconfigs():
+        try:
+            with open(f, encoding="utf-8") as fh:
+                apps = vdf_get(vdf_parse(fh.read()), "UserLocalConfigStore", "Software", "Valve",
+                               "Steam", "apps") or []
+        except Exception:  # noqa: BLE001
+            continue
+        for appid, name in steam_vr_games(root):
+            entry = next((v for k, v in apps if k == str(appid) and isinstance(v, list)), [])
+            lo = next((v for k, v in entry if k.lower() == "launchoptions"), "")
+            (done if options_ok(lo) else missing).append(name)
+    return sorted(set(done)), sorted(set(missing) - set(done))
+
+
+def steam_running():
+    return run(["pgrep", "-x", "steam"])[0] == 0
+
+
+def apply_launch_options():
+    """Write WiVRn launch options into every installed VR game. Steam must be closed."""
+    if not steam_launch_options():
+        return 0
+    changed = 0
+    for root, f in localconfigs():
+        with open(f, encoding="utf-8") as fh:
+            text = fh.read()
+        tree = vdf_parse(text)
+        apps = vdf_get(tree, "UserLocalConfigStore", "Software", "Valve", "Steam", "apps",
+                       create=True)
+        n = 0
+        for appid, _name in steam_vr_games(root):
+            entry = next((kv for kv in apps if kv[0] == str(appid) and isinstance(kv[1], list)), None)
+            if entry is None:
+                entry = [str(appid), []]
+                apps.append(entry)
+            lo = next((kv for kv in entry[1] if kv[0].lower() == "launchoptions"), None)
+            if lo is None:
+                lo = ["LaunchOptions", ""]
+                entry[1].append(lo)
+            if not options_ok(lo[1]):
+                lo[1] = wanted_options(lo[1])
+                n += 1
+        if n:
+            shutil.copy2(f, f + ".before-vr-control")
+            with open(f + ".tmp", "w", encoding="utf-8") as fh:
+                fh.write(vdf_dump(tree))
+            os.replace(f + ".tmp", f)
+            changed += n
+    return changed
+
+
+def set_launch_options_restarting_steam():
+    """Close Steam if needed, write the options, and start Steam again. Returns count."""
+    was_running = steam_running()
+    if was_running:
+        flat = steam_kind() == "flatpak"
+        run((["flatpak", "run", "com.valvesoftware.Steam"] if flat else ["steam"]) + ["-shutdown"],
+            timeout=20)
+        for _ in range(60):
+            if not steam_running():
+                break
+            time.sleep(0.5)
+        else:
+            raise RuntimeError("Steam didn't close – close it yourself and try again.")
+        time.sleep(1)
+    n = apply_launch_options()
+    if was_running:
+        cmd = (["flatpak", "run", "com.valvesoftware.Steam"] if steam_kind() == "flatpak"
+               else ["steam"]) + ["-silent"]
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    return n
 
 
 def steam_libraries():
@@ -526,10 +830,26 @@ def run_checks(settings):
                 ("action", "Let WiVRn see them", "allow_libraries"))
         elif sk:
             add("Games visible in the headset", OK, "WiVRn can read all your Steam libraries.")
+    if sk:
+        games = sync_headset_game_list()
+        if games:
+            add("Headset game list", OK, f"{len(games)} VR game{'s' * (len(games) != 1)}: "
+                + ", ".join(sorted(games)[:8]) + ("…" if len(games) > 8 else ""))
+        else:
+            add("Headset game list", WARN, "No installed Steam VR games found yet. Install one, "
+                "restart Steam, then press Check again.")
     opts = steam_launch_options()
-    if opts:
-        add("Steam launch options", INFO, "Paste into each VR game: Properties → Launch Options.",
-            ("cmd", opts))
+    if opts and sk:
+        done, missing = launch_option_status()
+        if missing:
+            add("VR launch options", BAD, "Not set for: " + ", ".join(missing) + ". VR Control "
+                "can add them to every VR game (Steam is closed and reopened to save them).",
+                ("action", "Set for all VR games", "launch_options"))
+        elif done:
+            add("VR launch options", OK, f"Set for all {len(done)} VR game"
+                f"{'s' * (len(done) != 1)}.")
+        add("Launch options (for other games)", INFO, "Added automatically to Steam VR games. "
+            "For anything else, paste into Properties → Launch Options:", ("cmd", opts))
 
     # Headset (can't be checked from the PC)
     add("WiVRn app on the headset", INFO, "Install WiVRn on the Quest (Meta Horizon Store, or "
@@ -818,6 +1138,20 @@ class VRControl(Gtk.ApplicationWindow):
         if key == "create_hotspot":
             self.create_hotspot()
             return
+        if key == "launch_options":
+            btn.set_sensitive(False)
+            btn.set_label("Closing Steam and saving…" if steam_running() else "Saving…")
+
+            def work():
+                try:
+                    n = set_launch_options_restarting_steam()
+                    GLib.idle_add(self.toast, f"Launch options set for {n} game(s)."
+                                  " Steam is starting again." if n else "Nothing needed changing.")
+                except Exception as e:  # noqa: BLE001
+                    GLib.idle_add(self.toast, str(e))
+                GLib.idle_add(self.refresh_checks)
+            self.bg(work)
+            return
         if key == "allow_libraries":
             for lib in wivrn_hidden_libraries():
                 run(["flatpak", "override", "--user", f"--filesystem={lib}:ro", WIVRN_APP])
@@ -910,6 +1244,12 @@ class VRControl(Gtk.ApplicationWindow):
             if not wivrn_installed():
                 GLib.idle_add(self.toast, "WiVRn isn't installed yet – see the Setup tab.")
             else:
+                sync_headset_game_list()
+                if steam_kind() and not steam_running():
+                    try:
+                        apply_launch_options()   # safe only while Steam is closed
+                    except Exception:  # noqa: BLE001
+                        pass
                 WiVRn.start()
                 for _ in range(40):
                     if self.wivrn.running():

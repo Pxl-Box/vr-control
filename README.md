@@ -10,6 +10,8 @@ and no SteamVR. One window does the whole thing:
 - **Pairing code**: shows the code to type on the headset the first time it connects.
 - **Live status**: headset connected, how long, game running, refresh rate, bitrate,
   hotspot devices and Wi-Fi traffic, GPU and video-encoder load (NVIDIA).
+- **Games in the headset**: fills WiVRn's in-headset game list with your installed Steam VR
+  games and adds the WiVRn launch options to every one of them, so you never type them in.
 - **Headset audio**: optionally switches sound output and/or mic to the headset while it's
   connected, and back afterwards.
 
@@ -63,11 +65,15 @@ WiVRn server.
    network name and password.
 4. Open WiVRn on the headset and pick your PC. The first time, press **Start pairing** in
    VR Control and type the 6-digit code into the headset.
-5. **Steam games**: copy the launch options from the Setup tab into each VR game
-   (right-click the game → Properties → Launch Options). They look like this:
+5. **Steam games**: on the Setup tab, press **Set for all VR games** if it's marked ✘.
+   VR Control writes these launch options into every installed Steam VR game, closing and
+   reopening Steam to save them (a backup `localconfig.vdf.before-vr-control` is kept):
    ```
    OXR_PARALLEL_VIEWS=0 XR_RUNTIME_JSON=/home/<you>/.local/share/flatpak/app/io.github.wivrn.wivrn/current/active/files/share/openxr/1/openxr_wivrn.json PRESSURE_VESSEL_FILESYSTEMS_RW=$XDG_RUNTIME_DIR/wivrn/comp_ipc %command%
    ```
+   Any options you already had (like `gamemoderun %command%` or game arguments) are kept.
+   **Start VR** also does this automatically whenever Steam is closed. For non-Steam apps,
+   copy the line from the Setup tab.
 6. Start games from the WiVRn app's game list in the headset, or from Steam on the PC.
 
 Each time after that: **Start VR** → put the headset on → WiVRn → play → **Stop VR**.
@@ -76,9 +82,9 @@ Each time after that: **Start VR** → put the headset on → WiVRn → play →
 
 | Problem | Fix |
 |---|---|
-| Game says *OpenXR runtime not found* | The launch options are missing or wrong. Copy them again from the Setup tab. WiVRn's own suggestion (`PRESSURE_VESSEL_IMPORT_OPENXR_1_RUNTIMES=1`) wasn't enough with the Flatpak. |
+| Game says *OpenXR runtime not found* | The launch options are missing or wrong. Press **Set for all VR games** on the Setup tab. WiVRn's own suggestion (`PRESSURE_VESSEL_IMPORT_OPENXR_1_RUNTIMES=1`) wasn't enough with the Flatpak. |
 | **Beat Saber pauses itself** and re-pauses as soon as you resume | Include `OXR_PARALLEL_VIEWS=0` in the launch options (already in the copied text). |
-| Headset says *waiting for an app* but the game list is empty | WiVRn is a Flatpak and can't see Steam libraries on other drives. Use **Let WiVRn see them** on the Setup tab, or run `flatpak override --user --filesystem=/path/to/SteamLibrary:ro io.github.wivrn.wivrn`, then restart the WiVRn server. Restart Steam after installing new games. |
+| Headset says *waiting for an app* but the game list is empty | WiVRn 26.9 reads the list from `steamapps.vrmanifest`, which current Steam no longer writes; VR Control writes it for you (Setup tab → "Headset game list"). Reconnect the headset after installing games. Also, WiVRn is a Flatpak and can't see Steam libraries on other drives. Use **Let WiVRn see them** on the Setup tab, or run `flatpak override --user --filesystem=/path/to/SteamLibrary:ro io.github.wivrn.wivrn`, then restart the WiVRn server. Restart Steam after installing new games. |
 | No game sound in the headset | Turn on "Switch sound output to the headset", or press **Send audio to headset**. |
 | PC doesn't appear in the headset list | Check the firewall line on the Setup tab and that Avahi is running. |
 | Picture is blurry | Raise the bitrate in **Open WiVRn settings** (around 100 Mbit/s works well on 5 GHz) and the resolution scale in the headset app. Adjust the headset's IPD slider and fit too. |
@@ -89,6 +95,11 @@ Each time after that: **Start VR** → put the headset on → WiVRn → play →
 Run `vr-control --check` in a terminal for the same checklist as the Setup tab.
 
 ## How it works
+
+- Headset game list: VR games are read from Steam's `appcache/appinfo.vdf` (`openvrsupport`)
+  and written to `<steam>/config/steamapps.vrmanifest`, the file WiVRn 26.9 reads.
+- Launch options: written to `userdata/<id>/config/localconfig.vdf` (`LaunchOptions`) only
+  while Steam is closed, since Steam overwrites that file when it exits.
 
 - Hotspot: an ordinary NetworkManager access-point connection
   (`nmcli con up/down <name>`), so it also shows up in your normal network settings.
