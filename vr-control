@@ -1,0 +1,1153 @@
+#!/usr/bin/env python3
+"""VR Control: one window to stream PC VR games to a Meta Quest over Wi-Fi with WiVRn.
+
+- Setup tab        -> checks everything needed is installed/configured, with one-click fixes
+- Hotspot switch   -> a NetworkManager Wi-Fi hotspot (access point) for the headset
+- WiVRn switch     -> starts wivrn-server from the WiVRn Flatpak / quits it over D-Bus
+- Pairing PIN      -> io.github.wivrn.Server.EnablePairing
+- Live status      -> WiVRn D-Bus properties, hotspot clients, Wi-Fi throughput, GPU
+- Audio            -> optionally moves sound output / microphone to the headset while connected
+
+https://github.com/Pxl-Box/vr-control
+"""
+import json
+import os
+import secrets
+import shutil
+import string
+import subprocess
+import threading
+import time
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
+
+VERSION = "1.0.0"
+WIVRN_APP = "io.github.wivrn.wivrn"
+BUS_NAME = "io.github.wivrn.Server"
+OBJ_PATH = "/io/github/wivrn/Server"
+IFACE = "io.github.wivrn.Server"
+CONF_DIR = os.path.join(GLib.get_user_config_dir(), "vr-control")
+SETTINGS = os.path.join(CONF_DIR, "settings.json")
+PREV_FILE = os.path.join(CONF_DIR, "prev-audio.json")
+DEFAULTS = {"auto_audio_out": True, "auto_audio_mic": True, "hotspot": None}
+WIVRN_HEADSET_URL = "https://github.com/WiVRn/WiVRn#installation"
+WIVRN_URL = "https://github.com/WiVRn/WiVRn"
+FLATPAK_SETUP_URL = "https://flathub.org/setup"
+
+CSS = b"""
+.big-title { font-size: 20px; font-weight: bold; }
+.pin { font-size: 44px; font-weight: bold; letter-spacing: 8px; font-family: monospace; }
+.state-ok { color: #3fb950; font-weight: bold; }
+.state-warn { color: #d29922; font-weight: bold; }
+.state-off { color: #8b949e; font-weight: bold; }
+.state-bad { color: #f85149; font-weight: bold; }
+.state-info { color: #58a6ff; font-weight: bold; }
+.mark { font-size: 18px; font-weight: bold; min-width: 24px; }
+.card { border: 1px solid alpha(currentColor, 0.15); border-radius: 10px; padding: 14px; }
+.card-title { font-weight: bold; font-size: 14px; }
+.dim { opacity: 0.7; }
+.mono { font-family: monospace; font-size: 12px; }
+"""
+
+
+def run(cmd, timeout=5):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, (r.stdout.strip() or r.stderr.strip())
+    except Exception as e:  # noqa: BLE001
+        return 1, str(e)
+
+
+def have(cmd):
+    return shutil.which(cmd) is not None
+
+
+# ---------------------------------------------------------------- settings
+def load_settings():
+    try:
+        with open(SETTINGS) as f:
+            st = {**DEFAULTS, **json.load(f)}
+        if "auto_audio" in st:       # older single switch -> both new switches
+            st["auto_audio_out"] = st["auto_audio_mic"] = st.pop("auto_audio")
+        return st
+    except Exception:  # noqa: BLE001
+        return dict(DEFAULTS)
+
+
+def save_settings(st):
+    os.makedirs(CONF_DIR, exist_ok=True)
+    with open(SETTINGS, "w") as f:
+        json.dump(st, f, indent=2)
+
+
+# ---------------------------------------------------------------- system probes
+def distro_family():
+    ids = ""
+    try:
+        with open("/etc/os-release") as f:
+            for line in f:
+                if line.startswith(("ID=", "ID_LIKE=")):
+                    ids += " " + line.split("=", 1)[1].strip().strip('"')
+    except OSError:
+        pass
+    for fam in ("arch", "fedora", "suse", "debian", "ubuntu"):
+        if fam in ids:
+            return "debian" if fam == "ubuntu" else fam
+    return "unknown"
+
+
+PKG = {  # what to install for a missing tool, per distro family
+    "flatpak": {"debian": "sudo apt install flatpak", "fedora": "sudo dnf install flatpak",
+                "arch": "sudo pacman -S flatpak", "suse": "sudo zypper install flatpak"},
+    "nmcli": {"debian": "sudo apt install network-manager",
+              "fedora": "sudo dnf install NetworkManager",
+              "arch": "sudo pacman -S networkmanager",
+              "suse": "sudo zypper install NetworkManager"},
+    "pactl": {"debian": "sudo apt install pipewire-pulse pulseaudio-utils",
+              "fedora": "sudo dnf install pipewire-pulseaudio pulseaudio-utils",
+              "arch": "sudo pacman -S pipewire-pulse libpulse",
+              "suse": "sudo zypper install pipewire-pulseaudio pulseaudio-utils"},
+    "avahi": {"debian": "sudo apt install avahi-daemon && sudo systemctl enable --now avahi-daemon",
+              "fedora": "sudo dnf install avahi && sudo systemctl enable --now avahi-daemon",
+              "arch": "sudo pacman -S avahi && sudo systemctl enable --now avahi-daemon",
+              "suse": "sudo zypper install avahi && sudo systemctl enable --now avahi-daemon"},
+}
+
+
+def pkg_cmd(tool):
+    fam = distro_family()
+    return PKG[tool].get(fam) or "Install it with your distro's package manager."
+
+
+def wifi_device():
+    rc, out = run(["nmcli", "-t", "-f", "DEVICE,TYPE", "dev"])
+    for line in out.splitlines() if rc == 0 else []:
+        dev, _, typ = line.rpartition(":")
+        if typ == "wifi" and not dev.startswith("p2p-"):
+            return dev
+    return None
+
+
+def wifi_caps(dev):
+    rc, out = run(["nmcli", "-t", "-f", "WIFI-PROPERTIES.AP,WIFI-PROPERTIES.5GHZ", "dev", "show", dev])
+    caps = dict(l.split(":", 1) for l in out.splitlines() if ":" in l) if rc == 0 else {}
+    return caps.get("WIFI-PROPERTIES.AP") == "yes", caps.get("WIFI-PROPERTIES.5GHZ") == "yes"
+
+
+def find_hotspots():
+    """Names of NetworkManager Wi-Fi connections in access-point (hotspot) mode."""
+    rc, out = run(["nmcli", "-t", "-f", "NAME,TYPE", "con", "show"])
+    names = []
+    for line in out.splitlines() if rc == 0 else []:
+        name, _, typ = line.rpartition(":")
+        if typ == "802-11-wireless":
+            name = name.replace("\\:", ":")
+            if run(["nmcli", "-g", "802-11-wireless.mode", "con", "show", name])[1] == "ap":
+                names.append(name)
+    return names
+
+
+def wivrn_installed():
+    """'user', 'system' or None."""
+    if not have("flatpak"):
+        return None
+    if run(["flatpak", "info", "--user", WIVRN_APP])[0] == 0:
+        return "user"
+    if run(["flatpak", "info", "--system", WIVRN_APP])[0] == 0:
+        return "system"
+    return None
+
+
+def wivrn_version():
+    rc, out = run(["flatpak", "info", WIVRN_APP])
+    for line in out.splitlines() if rc == 0 else []:
+        if line.strip().startswith("Version:"):
+            return line.split(":", 1)[1].strip()
+    return None
+
+
+def wivrn_manifest():
+    """Path of WiVRn's OpenXR runtime manifest that survives Flatpak updates."""
+    rc, loc = run(["flatpak", "info", "--show-location", WIVRN_APP])
+    if rc != 0 or "/" + WIVRN_APP + "/" not in loc:
+        return None
+    base = loc.split("/" + WIVRN_APP + "/")[0] + "/" + WIVRN_APP
+    return base + "/current/active/files/share/openxr/1/openxr_wivrn.json"
+
+
+def steam_kind():
+    if have("steam"):
+        return "native"
+    if have("flatpak") and run(["flatpak", "info", "com.valvesoftware.Steam"])[0] == 0:
+        return "flatpak"
+    return None
+
+
+def steam_launch_options():
+    m = wivrn_manifest()
+    if not m:
+        return None
+    # OXR_PARALLEL_VIEWS=0: fixes Beat Saber pausing itself; harmless for other games.
+    return (f"OXR_PARALLEL_VIEWS=0 XR_RUNTIME_JSON={m} "
+            "PRESSURE_VESSEL_FILESYSTEMS_RW=$XDG_RUNTIME_DIR/wivrn/comp_ipc %command%")
+
+
+def firewall_status():
+    """('ufw'|'firewalld'|None, enabled?)"""
+    try:
+        with open("/etc/ufw/ufw.conf") as f:
+            if "ENABLED=yes" in f.read():
+                return "ufw", True
+    except OSError:
+        pass
+    if run(["systemctl", "is-active", "firewalld"])[1] == "active":
+        return "firewalld", True
+    return None, False
+
+
+def firewall_cmd(kind, dev):
+    if kind == "ufw":
+        return ("sudo ufw allow 9757/tcp && sudo ufw allow 9757/udp && sudo ufw allow 5353/udp"
+                + (f" && sudo ufw allow in on {dev}" if dev else ""))
+    if kind == "firewalld":
+        return ("sudo firewall-cmd --permanent --add-port=9757/tcp --add-port=9757/udp "
+                "--add-service=mdns && sudo firewall-cmd --reload")
+    return ""
+
+
+def gpu_encoder():
+    if have("nvidia-smi") and run(["nvidia-smi", "-L"])[0] == 0:
+        return "NVIDIA (NVENC)"
+    if any(n.startswith("renderD") for n in os.listdir("/dev/dri")) if os.path.isdir("/dev/dri") else False:
+        return "AMD / Intel (VA-API)"
+    return None
+
+
+# ---------------------------------------------------------------- live data
+def hotspot_on(con):
+    rc, out = run(["nmcli", "-t", "-f", "NAME", "con", "show", "--active"])
+    return bool(con) and rc == 0 and con in out.splitlines()
+
+
+def hotspot_info(con):
+    rc, out = run(["nmcli", "-t", "-g", "802-11-wireless.ssid,802-11-wireless.band,"
+                   "802-11-wireless.channel,IP4.ADDRESS", "con", "show", con])
+    lines = out.splitlines() if rc == 0 else []
+    return lines + [""] * (4 - len(lines))
+
+
+def hotspot_clients(dev):
+    rc, out = run(["ip", "-j", "neigh", "show", "dev", dev])
+    try:
+        return [n["dst"] for n in json.loads(out or "[]")
+                if n.get("state") and not set(n["state"]) & {"FAILED", "INCOMPLETE"}
+                and "." in n.get("dst", "")]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def iface_bytes(dev):
+    base = f"/sys/class/net/{dev}/statistics/"
+    try:
+        with open(base + "tx_bytes") as t, open(base + "rx_bytes") as r:
+            return int(t.read()), int(r.read())
+    except OSError:
+        return None
+
+
+def gpu_stats():
+    if not have("nvidia-smi"):
+        return None
+    rc, out = run(["nvidia-smi", "--query-gpu=utilization.gpu,temperature.gpu,memory.used,"
+                   "memory.total,utilization.encoder", "--format=csv,noheader,nounits"])
+    if rc != 0:
+        return None
+    try:
+        u, t, mu, mt, enc = [x.strip() for x in out.splitlines()[0].split(",")]
+        return dict(util=u, temp=t, mem=f"{int(mu)/1024:.1f}/{int(mt)/1024:.0f} GB", enc=enc)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def pa_names(kind):
+    """Names of PipeWire/PulseAudio sinks or sources (monitors excluded)."""
+    rc, out = run(["pactl", "list", kind, "short"])
+    names = [l.split("\t")[1] for l in out.splitlines() if "\t" in l] if rc == 0 else []
+    return [n for n in names if not n.endswith(".monitor")]
+
+
+def pa_default(kind):
+    return run(["pactl", "get-default-" + kind])[1]
+
+
+def route_audio(sink, source):
+    """Make sink/source the defaults and move every playing/recording stream onto them."""
+    moved = 0
+    if sink:
+        run(["pactl", "set-default-sink", sink])
+        for l in run(["pactl", "list", "sink-inputs", "short"])[1].splitlines():
+            moved += run(["pactl", "move-sink-input", l.split("\t")[0], sink])[0] == 0
+    if source:
+        run(["pactl", "set-default-source", source])
+        for l in run(["pactl", "list", "source-outputs", "short"])[1].splitlines():
+            moved += run(["pactl", "move-source-output", l.split("\t")[0], source])[0] == 0
+    return moved
+
+
+class WiVRn:
+    """Thin D-Bus client for the WiVRn server."""
+
+    def __init__(self):
+        self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+
+    def running(self):
+        try:
+            r = self.bus.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus",
+                                   "org.freedesktop.DBus", "NameHasOwner",
+                                   GLib.Variant("(s)", (BUS_NAME,)), None,
+                                   Gio.DBusCallFlags.NONE, 1000, None)
+            return r.unpack()[0]
+        except GLib.Error:
+            return False
+
+    def props(self):
+        try:
+            r = self.bus.call_sync(BUS_NAME, OBJ_PATH, "org.freedesktop.DBus.Properties",
+                                   "GetAll", GLib.Variant("(s)", (IFACE,)), None,
+                                   Gio.DBusCallFlags.NONE, 1000, None)
+            return r.unpack()[0]
+        except GLib.Error:
+            return None
+
+    def call(self, method, args=None, sig=None):
+        r = self.bus.call_sync(BUS_NAME, OBJ_PATH, IFACE, method,
+                               GLib.Variant(sig, args) if sig else None, None,
+                               Gio.DBusCallFlags.NONE, 3000, None)
+        return r.unpack() if r else None
+
+    @staticmethod
+    def start():
+        subprocess.Popen(["flatpak", "run", "--command=wivrn-server", WIVRN_APP],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+
+
+# ---------------------------------------------------------------- UI helpers
+def label(text="", css=None, xalign=0.0, wrap=False, select=False):
+    lb = Gtk.Label(label=text, xalign=xalign)
+    if css:
+        for c in css.split():
+            lb.get_style_context().add_class(c)
+    if wrap:
+        lb.set_line_wrap(True)
+        lb.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+    lb.set_selectable(select)
+    return lb
+
+
+def card(title):
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+    box.get_style_context().add_class("card")
+    box.pack_start(label(title, "card-title"), False, False, 0)
+    return box
+
+
+def set_state(lb, text, kind):
+    ctx = lb.get_style_context()
+    for c in ("ok", "warn", "off", "bad", "info"):
+        ctx.remove_class("state-" + c)
+    ctx.add_class("state-" + kind)
+    lb.set_text(text)
+
+
+def copy_text(widget, text):
+    Gtk.Clipboard.get_default(widget.get_display()).set_text(text, -1)
+
+
+class StatGrid(Gtk.Grid):
+    def __init__(self, keys):
+        super().__init__(column_spacing=16, row_spacing=4)
+        self.vals = {}
+        for i, k in enumerate(keys):
+            self.attach(label(k, "dim"), 0, i, 1, 1)
+            v = label("–")
+            v.set_hexpand(True)
+            self.attach(v, 1, i, 1, 1)
+            self.vals[k] = v
+
+    def set(self, k, v):
+        self.vals[k].set_text(str(v))
+
+
+# ---------------------------------------------------------------- setup checks
+OK, BAD, WARN, INFO = "ok", "bad", "warn", "info"
+MARK = {OK: "✔", BAD: "✘", WARN: "!", INFO: "i"}
+
+
+def run_checks(settings):
+    """Return a list of dicts: title, status, detail, and optional fix:
+    ('action', label, key) | ('cmd', command) | ('link', label, url)."""
+    c = []
+
+    def add(title, status, detail, *fixes):
+        c.append(dict(title=title, status=status, detail=detail, fixes=list(fixes)))
+
+    # Flatpak + Flathub + WiVRn
+    if have("flatpak"):
+        add("Flatpak", OK, "Installed.")
+        rc, remotes = run(["flatpak", "remotes", "--columns=name"])
+        if "flathub" in remotes.split():
+            add("Flathub app store", OK, "The Flathub remote is set up.")
+        else:
+            add("Flathub app store", BAD, "Needed to download WiVRn.",
+                ("action", "Add Flathub", "add_flathub"))
+    else:
+        add("Flatpak", BAD, "Needed to install WiVRn.", ("cmd", pkg_cmd("flatpak")),
+            ("link", "Flatpak setup guide", FLATPAK_SETUP_URL))
+    where = wivrn_installed()
+    if where:
+        add("WiVRn streaming server", OK, f"Version {wivrn_version() or '?'} ({where} install).")
+    else:
+        if have("flatpak"):
+            add("WiVRn streaming server", BAD, "Streams games to the headset (Flatpak from "
+                "Flathub).", ("action", "Install WiVRn", "install_wivrn"),
+                ("link", "About WiVRn", WIVRN_URL))
+        else:
+            add("WiVRn streaming server", BAD, "Install Flatpak first (above), then come back "
+                "here to install WiVRn.", ("link", "About WiVRn", WIVRN_URL))
+
+    # Network
+    dev = None
+    if have("nmcli"):
+        add("NetworkManager", OK, "Installed.")
+        dev = wifi_device()
+        if dev:
+            ap, five = wifi_caps(dev)
+            if ap:
+                add("Wi-Fi adapter", OK if five else WARN,
+                    f"{dev}: hotspot supported" + (", 5 GHz." if five else
+                    ", but no 5 GHz – 2.4 GHz works but is slower and laggier."))
+            else:
+                add("Wi-Fi adapter", BAD, f"{dev} can't act as a hotspot. Use a router instead: "
+                    "PC wired to it, headset on its 5 GHz Wi-Fi (skip the hotspot).")
+        else:
+            add("Wi-Fi adapter", WARN, "No Wi-Fi adapter found. You can still use a router: "
+                "PC wired to it, headset on its 5 GHz Wi-Fi (skip the hotspot).")
+        hs = settings.get("hotspot") if settings.get("hotspot") in find_hotspots() else None
+        hs = hs or next(iter(find_hotspots()), None)
+        if hs:
+            add("VR hotspot", OK, f"Using the “{hs}” hotspot connection.")
+        elif dev and wifi_caps(dev)[0]:
+            add("VR hotspot", BAD, "Create a private Wi-Fi network for the headset.",
+                ("action", "Create hotspot…", "create_hotspot"))
+    else:
+        add("NetworkManager", BAD, "Needed for the hotspot.", ("cmd", pkg_cmd("nmcli")))
+
+    # Discovery + firewall
+    if run(["systemctl", "is-active", "avahi-daemon"])[1] == "active":
+        add("Avahi (auto-discovery)", OK, "The headset will find this PC automatically.")
+    else:
+        add("Avahi (auto-discovery)", WARN, "Not running – the PC won't show up in the headset "
+            "list (you can still type its IP).", ("cmd", pkg_cmd("avahi")))
+    fw, on = firewall_status()
+    if on:
+        add(f"Firewall ({fw})", WARN, "Make sure WiVRn's ports are open (this can't be checked "
+            "without admin rights). Run once in a terminal:", ("cmd", firewall_cmd(fw, dev)))
+    else:
+        add("Firewall", OK, "No active firewall blocking WiVRn.")
+
+    # Audio, GPU, Steam
+    if have("pactl"):
+        add("Audio (PipeWire/PulseAudio)", OK, "Headset audio switching available.")
+    else:
+        add("Audio (PipeWire/PulseAudio)", WARN, "pactl missing – audio switching disabled.",
+            ("cmd", pkg_cmd("pactl")))
+    enc = gpu_encoder()
+    add("GPU video encoder", OK if enc else BAD, enc or "No GPU render device found.")
+    sk = steam_kind()
+    if sk == "native":
+        add("Steam", OK, "Installed. Add the launch options below to each VR game.")
+    elif sk == "flatpak":
+        add("Steam", WARN, "Flatpak Steam needs extra permissions for WiVRn – see the WiVRn docs "
+            "(native Steam is simpler).", ("link", "WiVRn docs", WIVRN_URL))
+    else:
+        add("Steam", WARN, "Not found (only needed for Steam games).")
+    opts = steam_launch_options()
+    if opts:
+        add("Steam launch options", INFO, "Paste into each VR game: Properties → Launch Options.",
+            ("cmd", opts))
+
+    # Headset (can't be checked from the PC)
+    add("WiVRn app on the headset", INFO, "Install WiVRn on the Quest (Meta Horizon Store, or "
+        f"sideload the APK). Use the same version as the PC ({wivrn_version() or 'see above'}).",
+        ("link", "Headset install guide", WIVRN_HEADSET_URL))
+    return c
+
+
+class HotspotDialog(Gtk.Dialog):
+    def __init__(self, parent, five):
+        super().__init__(title="Create VR hotspot", transient_for=parent, modal=True)
+        self.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        ok = self.add_button("Create", Gtk.ResponseType.OK)
+        ok.get_style_context().add_class("suggested-action")
+        box = self.get_content_area()
+        box.set_spacing(8)
+        box.set_border_width(16)
+        box.pack_start(label("A private Wi-Fi network from this PC, just for the headset. "
+                             "Your normal internet connection is unaffected.", "dim", wrap=True),
+                       False, False, 0)
+        grid = Gtk.Grid(column_spacing=12, row_spacing=8)
+        self.ssid = Gtk.Entry(text="vr-hotspot", hexpand=True)
+        alphabet = string.ascii_letters + string.digits
+        self.pw = Gtk.Entry(text="".join(secrets.choice(alphabet) for _ in range(12)))
+        self.band = Gtk.ComboBoxText()
+        if five:
+            self.band.append("a", "5 GHz (best)")
+        self.band.append("bg", "2.4 GHz")
+        self.band.set_active(0)
+        for i, (k, w) in enumerate((("Network name", self.ssid), ("Password", self.pw),
+                                    ("Band", self.band))):
+            grid.attach(label(k), 0, i, 1, 1)
+            grid.attach(w, 1, i, 1, 1)
+        box.pack_start(grid, False, False, 0)
+        self.err = label("", "state-bad", wrap=True)
+        box.pack_start(self.err, False, False, 0)
+        self.show_all()
+
+
+# ---------------------------------------------------------------- window
+class VRControl(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="VR Control")
+        self.set_default_size(580, 760)
+        self.set_icon_name("vr-control")
+        self.wivrn = WiVRn()
+        self.busy = False          # suppress switch feedback while we set it
+        self.pending = {}          # target state for in-flight toggles
+        self.last_bytes = None
+        self.last_t = None
+        self.connected_since = None
+        self.pair_until = 0
+        self.settings = load_settings()
+        self.prev_audio = self.load_prev()  # (sink, source) to restore after the headset leaves
+        self.was_connected = False
+        self.hotspot = None
+        self.dev = None
+        self.first_check = True
+        self.resolve_network()
+
+        hb = Gtk.HeaderBar(show_close_button=True)
+        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
+        sw = Gtk.StackSwitcher(stack=self.stack)
+        hb.set_custom_title(sw)
+        self.start_all_btn = Gtk.Button(label="Start VR")
+        self.start_all_btn.get_style_context().add_class("suggested-action")
+        self.start_all_btn.connect("clicked", self.on_start_all)
+        hb.pack_start(self.start_all_btn)
+        self.stop_all_btn = Gtk.Button(label="Stop VR")
+        self.stop_all_btn.connect("clicked", self.on_stop_all)
+        hb.pack_start(self.stop_all_btn)
+        self.set_titlebar(hb)
+        self.add(self.stack)
+
+        self.stack.add_titled(self.build_control(), "control", "Control")
+        self.stack.add_titled(self.build_setup(), "setup", "Setup")
+
+        self.show_all()
+        self.stop = False
+        self.refresh_checks()
+        threading.Thread(target=self.poll_loop, daemon=True).start()
+
+    def resolve_network(self):
+        hs = find_hotspots() if have("nmcli") else []
+        want = self.settings.get("hotspot")
+        self.hotspot = want if want in hs else (hs[0] if hs else None)
+        self.dev = None
+        if self.hotspot:
+            d = run(["nmcli", "-g", "connection.interface-name", "con", "show", self.hotspot])[1]
+            self.dev = d or None
+        self.dev = self.dev or (wifi_device() if have("nmcli") else None)
+
+    # ------------------------------------------------------------ control page
+    def build_control(self):
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin=16)
+        scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+        scroll.add(root)
+
+        self.setup_banner = Gtk.InfoBar(message_type=Gtk.MessageType.WARNING, no_show_all=True)
+        self.setup_banner.get_content_area().add(label("Some setup steps are missing.", wrap=True))
+        self.setup_banner.add_button("Open Setup", 1)
+        self.setup_banner.connect("response", lambda *_: self.stack.set_visible_child_name("setup"))
+        root.pack_start(self.setup_banner, False, False, 0)
+
+        banner = card("Headset")
+        self.hs_state = label("Not connected", "big-title")
+        banner.pack_start(self.hs_state, False, False, 0)
+        self.hs_hint = label("", "dim", wrap=True)
+        banner.pack_start(self.hs_hint, False, False, 0)
+        self.hs_grid = StatGrid(["Headset", "Connected for", "Game running", "Refresh rate",
+                                 "Stream bitrate", "Codecs", "Audio", "Hand tracking"])
+        banner.pack_start(self.hs_grid, False, False, 0)
+        btns = Gtk.Box(spacing=8)
+        self.audio_btn = Gtk.Button(label="Send audio to headset")
+        self.audio_btn.connect("clicked", self.on_audio)
+        btns.pack_start(self.audio_btn, False, False, 0)
+        self.disc_btn = Gtk.Button(label="Disconnect headset")
+        self.disc_btn.connect("clicked", lambda *_: self.safe_call("Disconnect"))
+        btns.pack_start(self.disc_btn, False, False, 0)
+        banner.pack_start(btns, False, False, 0)
+        root.pack_start(banner, False, False, 0)
+
+        ac = card("When the headset connects")
+        for key, text, sub in (
+            ("auto_audio_out", "Switch sound output to the headset",
+             "Game and desktop sound plays in the headset; switched back when it disconnects."),
+            ("auto_audio_mic", "Switch microphone to the headset",
+             "Uses the headset mic for voice chat; switched back when it disconnects."),
+        ):
+            row = Gtk.Box(spacing=8)
+            col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            col.pack_start(label(text), False, False, 0)
+            col.pack_start(label(sub, "dim", wrap=True), False, False, 0)
+            row.pack_start(col, True, True, 0)
+            sw = Gtk.Switch(valign=Gtk.Align.CENTER, active=self.settings[key])
+            sw.connect("notify::active", self.on_setting, key)
+            row.pack_end(sw, False, False, 0)
+            ac.pack_start(row, False, False, 0)
+        root.pack_start(ac, False, False, 0)
+
+        hc = card("Wi-Fi hotspot")
+        row = Gtk.Box(spacing=8)
+        self.hs_label = label("Off")
+        self.hs_label.set_hexpand(True)
+        row.pack_start(self.hs_label, True, True, 0)
+        self.hot_sw = Gtk.Switch()
+        self.hot_sw.connect("notify::active", self.on_hotspot)
+        row.pack_end(self.hot_sw, False, False, 0)
+        hc.pack_start(row, False, False, 0)
+        self.hot_grid = StatGrid(["Network", "Password", "Band / channel", "PC address",
+                                  "Devices", "Wi-Fi traffic"])
+        hc.pack_start(self.hot_grid, False, False, 0)
+        root.pack_start(hc, False, False, 0)
+
+        wc = card("WiVRn server")
+        row = Gtk.Box(spacing=8)
+        self.wv_label = label("Stopped")
+        self.wv_label.set_hexpand(True)
+        row.pack_start(self.wv_label, True, True, 0)
+        self.wv_sw = Gtk.Switch()
+        self.wv_sw.connect("notify::active", self.on_wivrn)
+        row.pack_end(self.wv_sw, False, False, 0)
+        wc.pack_start(row, False, False, 0)
+        self.wv_grid = StatGrid(["PC name", "Paired headsets", "Encryption"])
+        wc.pack_start(self.wv_grid, False, False, 0)
+        dash = Gtk.Button(label="Open WiVRn settings")
+        dash.set_halign(Gtk.Align.START)
+        dash.connect("clicked", lambda *_: subprocess.Popen(
+            ["flatpak", "run", WIVRN_APP], start_new_session=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+        wc.pack_start(dash, False, False, 0)
+        root.pack_start(wc, False, False, 0)
+
+        pc = card("Pair a headset")
+        pc.pack_start(label("Needed the first time a headset connects. Start pairing, then type "
+                            "this code on the headset.", "dim", wrap=True), False, False, 0)
+        self.pin_label = label("— — — — — —", "pin", xalign=0.5, select=True)
+        pc.pack_start(self.pin_label, False, False, 0)
+        self.pin_hint = label("", "dim", xalign=0.5)
+        pc.pack_start(self.pin_hint, False, False, 0)
+        pb = Gtk.Box(spacing=8)
+        self.pair_btn = Gtk.Button(label="Start pairing (2 min)")
+        self.pair_btn.connect("clicked", self.on_pair)
+        pb.pack_start(self.pair_btn, False, False, 0)
+        self.unpair_btn = Gtk.Button(label="Stop pairing")
+        self.unpair_btn.connect("clicked", lambda *_: self.safe_call("DisablePairing"))
+        pb.pack_start(self.unpair_btn, False, False, 0)
+        pc.pack_start(pb, False, False, 0)
+        root.pack_start(pc, False, False, 0)
+
+        gc = card("PC")
+        self.gpu_grid = StatGrid(["GPU load", "Video encoder", "GPU temp", "VRAM"])
+        gc.pack_start(self.gpu_grid, False, False, 0)
+        root.pack_start(gc, False, False, 0)
+        return scroll
+
+    # ------------------------------------------------------------ setup page
+    def build_setup(self):
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin=16)
+        scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+        scroll.add(root)
+        top = Gtk.Box(spacing=8)
+        self.setup_summary = label("Checking…", "big-title")
+        self.setup_summary.set_hexpand(True)
+        top.pack_start(self.setup_summary, True, True, 0)
+        recheck = Gtk.Button(label="Check again")
+        recheck.connect("clicked", lambda *_: self.refresh_checks())
+        top.pack_end(recheck, False, False, 0)
+        root.pack_start(top, False, False, 0)
+        self.checks_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        cc = card("Checklist")
+        cc.pack_start(self.checks_box, False, False, 0)
+        root.pack_start(cc, False, False, 0)
+
+        steps = card("Each time you play")
+        steps.pack_start(label(
+            "1. Press Start VR (turns on the hotspot and the WiVRn server).\n"
+            "2. On the headset, join the hotspot Wi-Fi shown on the Control tab.\n"
+            "3. Open the WiVRn app on the headset and pick this PC.\n"
+            "   First time only: press “Start pairing” and type the code it shows.\n"
+            "4. Start a game from the WiVRn app's list, or from Steam on the PC.\n"
+            "5. Press Stop VR when you're done.", wrap=True), False, False, 0)
+        root.pack_start(steps, False, False, 0)
+        root.pack_start(label(f"VR Control {VERSION}", "dim", xalign=1), False, False, 0)
+        return scroll
+
+    def refresh_checks(self):
+        self.setup_summary.set_text("Checking…")
+
+        def work():
+            res = run_checks(self.settings)
+            GLib.idle_add(self.show_checks, res)
+        self.bg(work)
+
+    def show_checks(self, res):
+        for ch in self.checks_box.get_children():
+            self.checks_box.remove(ch)
+        bad = sum(r["status"] == BAD for r in res)
+        warn = sum(r["status"] == WARN for r in res)
+        for r in res:
+            row = Gtk.Box(spacing=10, margin_top=4, margin_bottom=4)
+            mark = label(MARK[r["status"]], "mark state-" + r["status"], xalign=0.5)
+            mark.set_valign(Gtk.Align.START)
+            row.pack_start(mark, False, False, 0)
+            col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+            col.pack_start(label(r["title"], "card-title"), False, False, 0)
+            col.pack_start(label(r["detail"], "dim", wrap=True), False, False, 0)
+            for fx in r["fixes"]:
+                col.pack_start(self.fix_widget(fx), False, False, 0)
+            row.pack_start(col, True, True, 0)
+            self.checks_box.pack_start(row, False, False, 0)
+            self.checks_box.pack_start(Gtk.Separator(), False, False, 0)
+        if bad:
+            set_state(self.setup_summary, f"✘ {bad} thing{'s' if bad > 1 else ''} to fix", "bad")
+        elif warn:
+            set_state(self.setup_summary, f"! Ready – {warn} thing{'s' if warn > 1 else ''} to "
+                      "double-check", "warn")
+        else:
+            set_state(self.setup_summary, "✔ Everything's ready", "ok")
+        self.setup_banner.set_visible(bad > 0)
+        if bad and self.first_check:
+            self.stack.set_visible_child_name("setup")
+        self.first_check = False
+        self.checks_box.show_all()
+        return False
+
+    def fix_widget(self, fx):
+        kind = fx[0]
+        if kind == "action":
+            b = Gtk.Button(label=fx[1], halign=Gtk.Align.START)
+            b.get_style_context().add_class("suggested-action")
+            b.connect("clicked", lambda btn: self.do_fix(fx[2], btn))
+            return b
+        if kind == "link":
+            return Gtk.LinkButton(uri=fx[2], label=fx[1], halign=Gtk.Align.START)
+        box = Gtk.Box(spacing=6)
+        lb = label(fx[1], "mono", wrap=True, select=True)
+        lb.set_hexpand(True)
+        box.pack_start(lb, True, True, 0)
+        cp = Gtk.Button(label="Copy", valign=Gtk.Align.START)
+        cp.connect("clicked", lambda b: copy_text(b, fx[1]))
+        box.pack_end(cp, False, False, 0)
+        return box
+
+    def do_fix(self, key, btn):
+        if key == "create_hotspot":
+            self.create_hotspot()
+            return
+        cmds = {
+            "add_flathub": ["flatpak", "remote-add", "--user", "--if-not-exists", "flathub",
+                            "https://dl.flathub.org/repo/flathub.flatpakrepo"],
+            "install_wivrn": ["flatpak", "install", "-y", "--noninteractive", "--user",
+                              "flathub", WIVRN_APP],
+        }
+        btn.set_sensitive(False)
+        btn.set_label("Working… (this can take a few minutes)")
+
+        def work():
+            if key == "install_wivrn" and "flathub" not in run(
+                    ["flatpak", "remotes", "--user", "--columns=name"])[1].split():
+                run(cmds["add_flathub"], timeout=120)
+            rc, out = run(cmds[key], timeout=1800)
+            if rc != 0:
+                GLib.idle_add(self.toast, f"That didn't work:\n{out[-800:]}")
+            GLib.idle_add(self.refresh_checks)
+        self.bg(work)
+
+    def create_hotspot(self):
+        dev = wifi_device()
+        if not dev:
+            self.toast("No Wi-Fi adapter found.")
+            return
+        dlg = HotspotDialog(self, wifi_caps(dev)[1])
+        while dlg.run() == Gtk.ResponseType.OK:
+            ssid, pw, band = dlg.ssid.get_text().strip(), dlg.pw.get_text(), dlg.band.get_active_id()
+            if not ssid or len(pw) < 8 or len(pw) > 63:
+                dlg.err.set_text("Enter a name and a password of 8–63 characters.")
+                continue
+            rc, out = run(["nmcli", "con", "add", "type", "wifi", "ifname", dev, "con-name", ssid,
+                           "autoconnect", "no", "ssid", ssid, "802-11-wireless.mode", "ap",
+                           "802-11-wireless.band", band, "ipv4.method", "shared",
+                           "wifi-sec.key-mgmt", "wpa-psk", "wifi-sec.proto", "rsn",
+                           "wifi-sec.pairwise", "ccmp", "wifi-sec.group", "ccmp",
+                           "wifi-sec.psk", pw], timeout=20)
+            if rc != 0:
+                dlg.err.set_text(f"Couldn't create it: {out}")
+                continue
+            self.settings["hotspot"] = ssid
+            save_settings(self.settings)
+            self.resolve_network()
+            break
+        dlg.destroy()
+        self.refresh_checks()
+
+    # ------------------------------------------------------------ actions
+    def safe_call(self, method, args=None, sig=None):
+        try:
+            return self.wivrn.call(method, args, sig)
+        except GLib.Error as e:
+            self.toast(f"WiVRn: {e.message}")
+            return None
+
+    def toast(self, msg):
+        dlg = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.INFO,
+                                buttons=Gtk.ButtonsType.OK, text=msg)
+        dlg.run()
+        dlg.destroy()
+        return False
+
+    def bg(self, fn):
+        threading.Thread(target=fn, daemon=True).start()
+
+    def set_hotspot(self, on):
+        self.pending["hot"] = on
+        if not self.hotspot:
+            if on:
+                GLib.idle_add(self.toast, "No hotspot set up yet – see the Setup tab.")
+        elif on:
+            run(["nmcli", "radio", "wifi", "on"])
+            rc, out = run(["nmcli", "con", "up", self.hotspot], timeout=30)
+            if rc != 0:
+                GLib.idle_add(self.toast, f"Couldn't start the hotspot:\n{out}")
+        else:
+            run(["nmcli", "con", "down", self.hotspot], timeout=15)
+        self.pending.pop("hot", None)
+
+    def set_wivrn(self, on):
+        self.pending["wv"] = on
+        if on and not self.wivrn.running():
+            if not wivrn_installed():
+                GLib.idle_add(self.toast, "WiVRn isn't installed yet – see the Setup tab.")
+            else:
+                WiVRn.start()
+                for _ in range(40):
+                    if self.wivrn.running():
+                        break
+                    time.sleep(0.25)
+        elif not on and self.wivrn.running():
+            try:
+                self.wivrn.call("Quit")
+            except GLib.Error:
+                pass
+            for _ in range(40):
+                if not self.wivrn.running():
+                    break
+                time.sleep(0.25)
+        self.pending.pop("wv", None)
+
+    def on_hotspot(self, sw, _p):
+        if not self.busy:
+            on = sw.get_active()
+            self.pending["hot"] = on
+            self.bg(lambda: self.set_hotspot(on))
+
+    def on_wivrn(self, sw, _p):
+        if not self.busy:
+            on = sw.get_active()
+            self.pending["wv"] = on
+            self.bg(lambda: self.set_wivrn(on))
+
+    def on_start_all(self, *_):
+        self.pending.update(hot=True, wv=True)
+        self.bg(lambda: (self.set_hotspot(True), self.set_wivrn(True)))
+
+    def on_stop_all(self, *_):
+        self.pending.update(hot=False, wv=False)
+        self.bg(lambda: (self.set_wivrn(False), self.set_hotspot(False)))
+
+    def on_pair(self, *_):
+        if not self.wivrn.running():
+            self.toast("Turn the WiVRn server on first.")
+            return
+        r = self.safe_call("EnablePairing", (120,), "(i)")
+        if r:
+            self.pair_until = time.time() + 120
+            self.pin_label.set_text(r[0])
+
+    def on_setting(self, sw, _p, key):
+        self.settings[key] = sw.get_active()
+        save_settings(self.settings)
+
+    # ------------------------------------------------------------ audio
+    def headset_audio(self):
+        sink = next((n for n in pa_names("sinks") if "wivrn" in n), None)
+        src = next((n for n in pa_names("sources") if "wivrn" in n), None)
+        return sink, src
+
+    def load_prev(self):
+        try:
+            with open(PREV_FILE) as f:
+                return tuple(json.load(f))
+        except Exception:  # noqa: BLE001
+            return None
+
+    def save_prev(self):
+        if self.prev_audio is None:
+            try:
+                os.remove(PREV_FILE)
+            except OSError:
+                pass
+        else:
+            os.makedirs(CONF_DIR, exist_ok=True)
+            with open(PREV_FILE, "w") as f:
+                json.dump(list(self.prev_audio), f)
+
+    def audio_to_headset(self, out=True, mic=True, quiet=False):
+        if not have("pactl"):
+            return
+        sink, src = None, None
+        for _ in range(20):          # the WiVRn devices appear a moment after connecting
+            sink, src = self.headset_audio()
+            if sink:
+                break
+            time.sleep(0.5)
+        if not sink:
+            if not quiet:
+                GLib.idle_add(self.toast, "The headset audio devices only exist while the "
+                              "headset is connected.")
+            return
+        sink = sink if out else None
+        src = src if mic else None
+        old_k, old_s = self.prev_audio or (None, None)
+        cur_k, cur_s = pa_default("sink"), pa_default("source")
+        self.prev_audio = (old_k or (cur_k if sink and "wivrn" not in cur_k else None),
+                           old_s or (cur_s if src and "wivrn" not in cur_s else None))
+        self.save_prev()
+        n = route_audio(sink, src)
+        if not quiet:
+            what = " + ".join(w for w, ok in (("sound output", sink), ("microphone", src)) if ok)
+            GLib.idle_add(self.toast, f"Headset now used for {what}; moved {n} stream(s).")
+
+    def audio_restore(self):
+        if not self.prev_audio or not have("pactl"):
+            return
+        sink, src = self.prev_audio
+        self.prev_audio = None
+        self.save_prev()
+        names_k, names_s = pa_names("sinks"), pa_names("sources")
+        route_audio(sink if sink in names_k else None, src if src in names_s else None)
+
+    def on_audio(self, *_):
+        self.bg(self.audio_to_headset)
+
+    def on_connect_change(self, connected):
+        out, mic = self.settings["auto_audio_out"], self.settings["auto_audio_mic"]
+        if connected:
+            if out or mic:
+                self.audio_to_headset(out=out, mic=mic, quiet=True)
+        else:
+            self.audio_restore()       # only puts back what was switched
+
+    # ------------------------------------------------------------ polling
+    def poll_loop(self):
+        tick = 0
+        while not self.stop:
+            d = {}
+            hs, dev = self.hotspot, self.dev
+            d["hot"] = hotspot_on(hs)
+            if d["hot"]:
+                d["hot_info"] = hotspot_info(hs)
+                d["clients"] = hotspot_clients(dev) if dev else []
+                if tick % 10 == 0 or "psk" not in self.__dict__:
+                    self.psk = run(["nmcli", "-s", "-g", "802-11-wireless-security.psk",
+                                    "con", "show", hs])[1]
+            b = iface_bytes(dev) if dev else None
+            now = time.time()
+            if b and self.last_bytes and self.last_t:
+                dt = now - self.last_t
+                d["tx"] = (b[0] - self.last_bytes[0]) * 8 / dt / 1e6
+                d["rx"] = (b[1] - self.last_bytes[1]) * 8 / dt / 1e6
+            self.last_bytes, self.last_t = b, now
+            d["wv"] = self.wivrn.running()
+            d["props"] = self.wivrn.props() if d["wv"] else None
+            d["gpu"] = gpu_stats()
+            d["sink"] = have("pactl") and any("wivrn" in n for n in pa_names("sinks"))
+            conn = bool((d["props"] or {}).get("HeadsetConnected"))
+            if conn != self.was_connected:
+                self.was_connected = conn
+                self.bg(lambda c=conn: self.on_connect_change(c))
+            GLib.idle_add(self.update, d)
+            tick += 1
+            time.sleep(1)
+
+    def update(self, d):
+        self.busy = True
+        hot, wv, p = d["hot"], d["wv"], d["props"] or {}
+
+        if "hot" in self.pending:
+            set_state(self.hs_label, "Turning on…" if self.pending["hot"] else "Turning off…", "warn")
+        elif not self.hotspot:
+            self.hot_sw.set_active(False)
+            set_state(self.hs_label, "Not set up – see Setup", "off")
+        else:
+            self.hot_sw.set_active(hot)
+            set_state(self.hs_label, "On" if hot else "Off", "ok" if hot else "off")
+        self.hot_sw.set_sensitive(bool(self.hotspot))
+        ssid = None
+        if hot:
+            ssid, band, chan, addr = d["hot_info"][:4]
+            self.hot_grid.set("Network", ssid or self.hotspot)
+            self.hot_grid.set("Password", getattr(self, "psk", "") or "–")
+            self.hot_grid.set("Band / channel",
+                              f"{'5 GHz' if band == 'a' else '2.4 GHz' if band == 'bg' else band}"
+                              f" / {chan if chan and chan != '0' else 'auto'}")
+            self.hot_grid.set("PC address", addr.split("/")[0] if addr else "10.42.0.1")
+            cl = d["clients"]
+            self.hot_grid.set("Devices", f"{len(cl)} ({', '.join(cl)})" if cl else "0")
+        else:
+            for k in ("Network", "Password", "Band / channel", "PC address", "Devices"):
+                self.hot_grid.set(k, "–")
+        if "tx" in d and hot:
+            self.hot_grid.set("Wi-Fi traffic", f"↑ {d['tx']:.1f} Mbit/s   ↓ {d['rx']:.1f} Mbit/s")
+        else:
+            self.hot_grid.set("Wi-Fi traffic", "–")
+
+        if "wv" in self.pending:
+            set_state(self.wv_label, "Starting…" if self.pending["wv"] else "Stopping…", "warn")
+        else:
+            self.wv_sw.set_active(wv)
+            set_state(self.wv_label, "Running – waiting for headset" if wv and not
+                      p.get("HeadsetConnected") else "Running" if wv else "Stopped",
+                      "ok" if wv else "off")
+        keys = p.get("KnownKeys") or []
+        self.wv_grid.set("PC name", GLib.get_host_name() if wv else "–")
+        self.wv_grid.set("Paired headsets", ", ".join(k[0] for k in keys) if keys else
+                         ("none yet – pair below" if wv else "–"))
+        self.wv_grid.set("Encryption", ("on" if p.get("EncryptionEnabled") else "off") if wv else "–")
+
+        conn = bool(p.get("HeadsetConnected"))
+        if conn and not self.connected_since:
+            self.connected_since = time.time()
+        if not conn:
+            self.connected_since = None
+        if conn:
+            set_state(self.hs_state, "● Connected", "ok")
+            self.hs_hint.set_text("Start a game from the WiVRn app's list or from Steam.")
+        elif wv and hot:
+            set_state(self.hs_state, "● Waiting for headset", "warn")
+            self.hs_hint.set_text(f"On the headset: join the “{ssid or self.hotspot}” Wi-Fi, open "
+                                  f"WiVRn, pick {GLib.get_host_name()}."
+                                  + ("" if keys else " First time: press Start pairing below."))
+        else:
+            set_state(self.hs_state, "● Not ready", "off")
+            missing = [n for n, ok in (("hotspot", hot), ("WiVRn server", wv)) if not ok]
+            self.hs_hint.set_text("Turn on: " + " and ".join(missing) + " (or press Start VR).")
+        g = self.hs_grid
+        if conn:
+            g.set("Headset", p.get("SystemName") or "Quest")
+            s = int(time.time() - self.connected_since)
+            g.set("Connected for", f"{s // 3600}h {s // 60 % 60:02d}m {s % 60:02d}s" if s >= 3600
+                  else f"{s // 60}m {s % 60:02d}s")
+            g.set("Game running", "Yes" if p.get("SessionRunning") else "No")
+            rr = p.get("PreferredRefreshRate") or 0
+            avail = p.get("AvailableRefreshRates") or []
+            g.set("Refresh rate", (f"{rr:g} Hz" if rr else "auto") +
+                  (f"  (supports {', '.join(f'{r:g}' for r in avail)})" if avail else ""))
+            br = p.get("Bitrate") or 0
+            g.set("Stream bitrate", f"{br / 1e6:.0f} Mbit/s" if br else "auto")
+            g.set("Codecs", ", ".join(p.get("SupportedCodecs") or []) or "–")
+            sp = p.get("SpeakerChannels") or 0
+            g.set("Audio", (f"{sp} ch @ {p.get('SpeakerSampleRate', 0) // 1000} kHz"
+                            if sp else "none") + ("  · headset output ready" if d["sink"] else ""))
+            g.set("Hand tracking", "on" if p.get("HandTracking") else "off")
+        else:
+            for k in g.vals:
+                g.set(k, "–")
+        self.audio_btn.set_sensitive(conn and d["sink"])
+        self.disc_btn.set_sensitive(conn)
+
+        if p.get("PairingEnabled"):
+            if p.get("Pin"):
+                self.pin_label.set_text(p["Pin"])
+            left = int(self.pair_until - time.time())
+            self.pin_hint.set_text(f"Pairing open – {left}s left" if left > 0 else "Pairing open")
+        else:
+            self.pin_label.set_text("— — — — — —")
+            self.pin_hint.set_text("")
+        self.pair_btn.set_sensitive(wv)
+        self.unpair_btn.set_sensitive(bool(p.get("PairingEnabled")))
+
+        gp = d["gpu"]
+        if gp:
+            self.gpu_grid.set("GPU load", f"{gp['util']}%")
+            self.gpu_grid.set("Video encoder", f"{gp['enc']}%")
+            self.gpu_grid.set("GPU temp", f"{gp['temp']} °C")
+            self.gpu_grid.set("VRAM", gp["mem"])
+        else:
+            self.gpu_grid.set("GPU load", "only shown for NVIDIA GPUs")
+
+        self.start_all_btn.set_sensitive(not (hot and wv))
+        self.stop_all_btn.set_sensitive(hot or wv)
+        self.busy = False
+        return False
+
+
+class App(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id="io.github.vr_control.VRControl")
+
+    def do_activate(self):
+        win = self.props.active_window
+        if not win:
+            prov = Gtk.CssProvider()
+            prov.load_from_data(CSS)
+            Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), prov,
+                                                     Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+            win = VRControl(self)
+        win.present()
+
+
+def cli_check():
+    """`vr-control --check`: print the setup checklist in a terminal."""
+    for r in run_checks(load_settings()):
+        print(f"[{MARK[r['status']]}] {r['title']}: {r['detail']}")
+        for fx in r["fixes"]:
+            if fx[0] == "cmd":
+                print(f"      run: {fx[1]}")
+            elif fx[0] == "link":
+                print(f"      see: {fx[2]}")
+            elif fx[0] == "action":
+                print(f"      fix: open VR Control → Setup → “{fx[1]}”")
+
+
+if __name__ == "__main__":
+    import sys
+    if "--check" in sys.argv:
+        cli_check()
+    elif "--version" in sys.argv:
+        print(VERSION)
+    else:
+        App().run(None)
