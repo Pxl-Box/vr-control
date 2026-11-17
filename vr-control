@@ -580,19 +580,24 @@ PRESETS = {
     "latency": dict(
         label="Latency", pc={"encoder": {"encoder": "auto", "codec": "h264"}, "bit-depth": 8},
         blurb="For fast games (Beat Saber, rhythm, shooters). Faster encode/decode and the "
-              "highest refresh rate; a bit softer and blockier in fast motion.",
+              "highest refresh rate; a bit softer and blockier in fast motion (H.264 needs a higher "
+              "bitrate for the same look).",
+        target=dict(hz=120, bitrate=80e6),
         headset=[("Refresh rate", "120 Hz (highest)"), ("Resolution scale", "1.0"),
-                 ("Bitrate", "80 Mbit/s (H.264 needs more bits for the same look)")]),
+                 ("Bitrate", "80 Mbit/s")]),
     "balanced": dict(
         label="Balanced", pc={},
         blurb="WiVRn's defaults – good for most VR games.",
+        target=dict(hz=None, bitrate=50e6),
         headset=[("Refresh rate", "Automatic"), ("Resolution scale", "1.2 (default)"),
                  ("Bitrate", "50 Mbit/s (default)")]),
     "quality": dict(
         label="Quality", pc={"encoder": {"encoder": "auto", "codec": "h265"}, "bit-depth": 10},
-        blurb="For slow games and sightseeing. Sharpest picture; slightly more delay.",
+        blurb="For slow games and sightseeing. Sharpest picture; slightly more delay. High "
+              "bitrates need good 5 GHz signal, close to the PC.",
+        target=dict(hz=90, bitrate=100e6, at_least=True),
         headset=[("Refresh rate", "90 Hz"), ("Resolution scale", "1.4"),
-                 ("Bitrate", "100 Mbit/s or more (5 GHz, close to the PC)")]),
+                 ("Bitrate", "100+ Mbit/s")]),
 }
 
 
@@ -727,11 +732,18 @@ class WiVRn:
                                Gio.DBusCallFlags.NONE, 3000, None)
         return r.unpack() if r else None
 
-    @staticmethod
-    def start():
+    LOG = os.path.join(GLib.get_user_state_dir(), "vr-control", "wivrn-server.log")
+
+    @classmethod
+    def start(cls):
+        """Start the server, keeping its output (previous run kept as .old) for troubleshooting."""
+        os.makedirs(os.path.dirname(cls.LOG), exist_ok=True)
+        if os.path.exists(cls.LOG):
+            os.replace(cls.LOG, cls.LOG + ".old")
+        log = open(cls.LOG, "w")
         subprocess.Popen(["flatpak", "run", "--command=wivrn-server", WIVRN_APP],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         start_new_session=True)
+                         stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        log.close()
 
 
 # ---------------------------------------------------------------- UI helpers
@@ -779,6 +791,47 @@ class StatGrid(Gtk.Grid):
 
     def set(self, k, v):
         self.vals[k].set_text(str(v))
+
+
+class Columns(Gtk.Box):
+    """Cards in 1-3 columns depending on window width; each card goes into the shortest
+    column so wide windows don't leave big gaps."""
+    COL_WIDTH = 480
+
+    def __init__(self, max_cols=3):
+        super().__init__(spacing=12, homogeneous=True, valign=Gtk.Align.START)
+        self.max_cols = max_cols
+        self.cards = []
+        self.ncols = 0
+        self.connect("size-allocate", self._on_alloc)
+
+    def add_card(self, w):
+        w.set_valign(Gtk.Align.START)
+        self.cards.append(w)
+        self._layout(max(1, self.ncols))
+
+    def _on_alloc(self, _w, alloc):
+        n = max(1, min(self.max_cols, (alloc.width + 12) // (self.COL_WIDTH + 12)))
+        if n != self.ncols:
+            GLib.idle_add(self._layout, n)
+
+    def _layout(self, n):
+        self.ncols = n
+        for col in self.get_children():
+            for c in col.get_children():
+                col.remove(c)
+            self.remove(col)
+        cols = [Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12) for _ in range(n)]
+        heights = [0] * n
+        width = max(self.get_allocated_width(), self.COL_WIDTH * n) // n
+        for c in self.cards:
+            k = heights.index(min(heights))
+            cols[k].pack_start(c, False, False, 0)
+            heights[k] += c.get_preferred_height_for_width(width)[1] + 12
+        for col in cols:
+            self.pack_start(col, True, True, 0)
+        self.show_all()
+        return False
 
 
 # ---------------------------------------------------------------- setup checks
@@ -995,6 +1048,15 @@ class VRControl(Gtk.ApplicationWindow):
         self.dev = self.dev or (wifi_device() if have("nmcli") else None)
 
     # ------------------------------------------------------------ control page
+    # ------------------------------------------------------------ responsive layout
+    @staticmethod
+    def make_flow(max_cols=3):
+        return Columns(max_cols)
+
+    @staticmethod
+    def flow_add(flow, widget):
+        flow.add_card(widget)
+
     def build_control(self):
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin=16)
         scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
@@ -1005,6 +1067,8 @@ class VRControl(Gtk.ApplicationWindow):
         self.setup_banner.add_button("Open Setup", 1)
         self.setup_banner.connect("response", lambda *_: self.stack.set_visible_child_name("setup"))
         root.pack_start(self.setup_banner, False, False, 0)
+        flow = self.make_flow()
+        root.pack_start(flow, False, False, 0)
 
         banner = card("Headset")
         self.hs_state = label("Not connected", "big-title")
@@ -1022,7 +1086,7 @@ class VRControl(Gtk.ApplicationWindow):
         self.disc_btn.connect("clicked", lambda *_: self.safe_call("Disconnect"))
         btns.pack_start(self.disc_btn, False, False, 0)
         banner.pack_start(btns, False, False, 0)
-        root.pack_start(banner, False, False, 0)
+        self.flow_add(flow, banner)
 
         ac = card("When the headset connects")
         for key, text, sub in (
@@ -1040,7 +1104,7 @@ class VRControl(Gtk.ApplicationWindow):
             sw.connect("notify::active", self.on_setting, key)
             row.pack_end(sw, False, False, 0)
             ac.pack_start(row, False, False, 0)
-        root.pack_start(ac, False, False, 0)
+        self.flow_add(flow, ac)
 
         sc = card("Streaming preset")
         rb_row = Gtk.Box(spacing=0)
@@ -1063,7 +1127,7 @@ class VRControl(Gtk.ApplicationWindow):
         sc.pack_start(self.preset_grid, False, False, 0)
         self.preset_note = label("", "dim", wrap=True)
         sc.pack_start(self.preset_note, False, False, 0)
-        root.pack_start(sc, False, False, 0)
+        self.flow_add(flow, sc)
         cur = self.settings.get("preset") if self.settings.get("preset") in PRESETS else "balanced"
         self.preset_btns[cur].set_active(True)
         self.show_preset(cur)
@@ -1080,7 +1144,7 @@ class VRControl(Gtk.ApplicationWindow):
         self.hot_grid = StatGrid(["Network", "Password", "Band / channel", "PC address",
                                   "Devices", "Wi-Fi traffic"])
         hc.pack_start(self.hot_grid, False, False, 0)
-        root.pack_start(hc, False, False, 0)
+        self.flow_add(flow, hc)
 
         wc = card("WiVRn server")
         row = Gtk.Box(spacing=8)
@@ -1099,7 +1163,7 @@ class VRControl(Gtk.ApplicationWindow):
             ["flatpak", "run", WIVRN_APP], start_new_session=True,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
         wc.pack_start(dash, False, False, 0)
-        root.pack_start(wc, False, False, 0)
+        self.flow_add(flow, wc)
 
         pc = card("Pair a headset")
         pc.pack_start(label("Needed the first time a headset connects. Start pairing, then type "
@@ -1116,12 +1180,12 @@ class VRControl(Gtk.ApplicationWindow):
         self.unpair_btn.connect("clicked", lambda *_: self.safe_call("DisablePairing"))
         pb.pack_start(self.unpair_btn, False, False, 0)
         pc.pack_start(pb, False, False, 0)
-        root.pack_start(pc, False, False, 0)
+        self.flow_add(flow, pc)
 
         gc = card("PC")
         self.gpu_grid = StatGrid(["GPU load", "Video encoder", "GPU temp", "VRAM"])
         gc.pack_start(self.gpu_grid, False, False, 0)
-        root.pack_start(gc, False, False, 0)
+        self.flow_add(flow, gc)
         return scroll
 
     # ------------------------------------------------------------ setup page
@@ -1138,9 +1202,11 @@ class VRControl(Gtk.ApplicationWindow):
         top.pack_end(recheck, False, False, 0)
         root.pack_start(top, False, False, 0)
         self.checks_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        flow = self.make_flow(max_cols=2)
+        root.pack_start(flow, False, False, 0)
         cc = card("Checklist")
         cc.pack_start(self.checks_box, False, False, 0)
-        root.pack_start(cc, False, False, 0)
+        self.flow_add(flow, cc)
 
         steps = card("Each time you play")
         steps.pack_start(label(
@@ -1150,7 +1216,7 @@ class VRControl(Gtk.ApplicationWindow):
             "   First time only: press “Start pairing” and type the code it shows.\n"
             "4. Start a game from the WiVRn app's list, or from Steam on the PC.\n"
             "5. Press Stop VR when you're done.", wrap=True), False, False, 0)
-        root.pack_start(steps, False, False, 0)
+        self.flow_add(flow, steps)
         root.pack_start(label(f"VR Control {VERSION}", "dim", xalign=1), False, False, 0)
         return scroll
 
@@ -1378,15 +1444,46 @@ class VRControl(Gtk.ApplicationWindow):
         self.preset_blurb.set_text(pr["blurb"])
         for ch in self.preset_grid.get_children():
             self.preset_grid.remove(ch)
+        self.preset_now = {}
+        self.preset_key = key
         for i, (k, v) in enumerate(pr["headset"]):
             self.preset_grid.attach(label(k, "dim"), 0, i, 1, 1)
-            self.preset_grid.attach(label(v), 1, i, 1, 1)
+            val = label(v, wrap=True)
+            val.set_hexpand(True)
+            self.preset_grid.attach(val, 1, i, 1, 1)
+            now = label("")
+            self.preset_grid.attach(now, 2, i, 1, 1)
+            self.preset_now[k] = now
         self.preset_grid.show_all()
         codec = pr["pc"].get("encoder", {}).get("codec", "automatic").upper().replace("H2", "H.2")
         depth = pr["pc"].get("bit-depth")
         self.preset_note.set_text(f"PC side (set automatically): codec {codec}"
                                   + (f", {depth}-bit" if depth else "")
-                                  + ". Takes effect the next time the headset connects.")
+                                  + ". Takes effect the next time the headset connects. "
+                                  "WiVRn doesn't let the PC change the headset's settings, so "
+                                  "set the ✘ ones on the headset, then reconnect.")
+
+    def update_preset_marks(self, p, conn):
+        """Compare the headset's current refresh rate / bitrate with the preset's targets."""
+        if not getattr(self, "preset_now", None):
+            return
+        tg = PRESETS[self.preset_key]["target"]
+        for k, lb in self.preset_now.items():
+            if not conn:
+                set_state(lb, "", "off")
+            elif k == "Refresh rate":
+                hz = p.get("PreferredRefreshRate") or 0
+                ok = tg["hz"] is None or abs(hz - tg["hz"]) < 1
+                set_state(lb, ("✔ " if ok else "✘ ") + (f"now {hz:g} Hz" if hz else "now auto"),
+                          "ok" if ok else "bad")
+            elif k == "Bitrate":
+                br = p.get("Bitrate") or 0
+                ok = br >= tg["bitrate"] * 0.95 if tg.get("at_least") else \
+                    abs(br - tg["bitrate"]) <= tg["bitrate"] * 0.05
+                set_state(lb, ("✔ " if ok else "✘ ") + f"now {br / 1e6:.0f} Mbit/s",
+                          "ok" if ok else "bad")
+            else:
+                set_state(lb, "can't be read", "off")
 
     def on_preset(self, btn, key):
         if not btn.get_active():
@@ -1589,6 +1686,7 @@ class VRControl(Gtk.ApplicationWindow):
         else:
             for k in g.vals:
                 g.set(k, "–")
+        self.update_preset_marks(p, conn)
         self.audio_btn.set_sensitive(conn and d["sink"])
         self.disc_btn.set_sensitive(conn)
 
