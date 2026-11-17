@@ -35,7 +35,7 @@ IFACE = "io.github.wivrn.Server"
 CONF_DIR = os.path.join(GLib.get_user_config_dir(), "vr-control")
 SETTINGS = os.path.join(CONF_DIR, "settings.json")
 PREV_FILE = os.path.join(CONF_DIR, "prev-audio.json")
-DEFAULTS = {"auto_audio_out": True, "auto_audio_mic": True, "hotspot": None}
+DEFAULTS = {"auto_audio_out": True, "auto_audio_mic": True, "hotspot": None, "preset": "balanced"}
 WIVRN_HEADSET_URL = "https://github.com/WiVRn/WiVRn#installation"
 WIVRN_URL = "https://github.com/WiVRn/WiVRn"
 FLATPAK_SETUP_URL = "https://flathub.org/setup"
@@ -573,6 +573,58 @@ def gpu_encoder():
     return None
 
 
+# ---------------------------------------------------------------- streaming presets
+# On WiVRn 26.9 the PC decides codec + bit depth (its config overrides the headset);
+# refresh rate, resolution and bitrate are set in the headset app, so we list those.
+PRESETS = {
+    "latency": dict(
+        label="Latency", pc={"encoder": {"encoder": "auto", "codec": "h264"}, "bit-depth": 8},
+        blurb="For fast games (Beat Saber, rhythm, shooters). Faster encode/decode and the "
+              "highest refresh rate; a bit softer and blockier in fast motion.",
+        headset=[("Refresh rate", "120 Hz (highest)"), ("Resolution scale", "1.0"),
+                 ("Bitrate", "80 Mbit/s (H.264 needs more bits for the same look)")]),
+    "balanced": dict(
+        label="Balanced", pc={},
+        blurb="WiVRn's defaults – good for most VR games.",
+        headset=[("Refresh rate", "Automatic"), ("Resolution scale", "1.2 (default)"),
+                 ("Bitrate", "50 Mbit/s (default)")]),
+    "quality": dict(
+        label="Quality", pc={"encoder": {"encoder": "auto", "codec": "h265"}, "bit-depth": 10},
+        blurb="For slow games and sightseeing. Sharpest picture; slightly more delay.",
+        headset=[("Refresh rate", "90 Hz"), ("Resolution scale", "1.4"),
+                 ("Bitrate", "100 Mbit/s or more (5 GHz, close to the PC)")]),
+}
+
+
+def wivrn_config_path():
+    if wivrn_installed():
+        return os.path.expanduser("~/.var/app/io.github.wivrn.wivrn/config/wivrn/config.json")
+    return os.path.join(GLib.get_user_config_dir(), "wivrn", "config.json")
+
+
+def apply_preset(name):
+    """Set codec/bit depth in WiVRn's config, keeping any other keys the user has."""
+    path = wivrn_config_path()
+    try:
+        with open(path) as f:
+            cfg = json.load(f)
+    except Exception:  # noqa: BLE001
+        cfg = {}
+    for k in ("encoder", "bit-depth"):
+        cfg.pop(k, None)
+    pc = dict(PRESETS[name]["pc"])
+    if "encoder" in pc:            # pick the GPU's hardware encoder explicitly
+        enc = "nvenc" if gpu_encoder() and gpu_encoder().startswith("NVIDIA") else "vaapi"
+        pc["encoder"] = {**pc["encoder"], "encoder": enc}
+    cfg.update(pc)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if cfg:
+        with open(path, "w") as f:
+            json.dump(cfg, f, indent=2)
+    elif os.path.exists(path):
+        os.remove(path)
+
+
 # ---------------------------------------------------------------- live data
 def hotspot_on(con):
     rc, out = run(["nmcli", "-t", "-f", "NAME", "con", "show", "--active"])
@@ -990,6 +1042,32 @@ class VRControl(Gtk.ApplicationWindow):
             ac.pack_start(row, False, False, 0)
         root.pack_start(ac, False, False, 0)
 
+        sc = card("Streaming preset")
+        rb_row = Gtk.Box(spacing=0)
+        rb_row.get_style_context().add_class("linked")
+        self.preset_btns = {}
+        group = None
+        for key in ("latency", "balanced", "quality"):
+            b = Gtk.RadioButton.new_with_label_from_widget(group, PRESETS[key]["label"])
+            b.set_mode(False)                      # draw as toggle buttons
+            group = group or b
+            b.connect("toggled", self.on_preset, key)
+            self.preset_btns[key] = b
+            rb_row.pack_start(b, True, True, 0)
+        sc.pack_start(rb_row, False, False, 0)
+        self.preset_blurb = label("", "dim", wrap=True)
+        sc.pack_start(self.preset_blurb, False, False, 0)
+        sc.pack_start(label("Also set in the headset (WiVRn → Settings):", wrap=True),
+                      False, False, 0)
+        self.preset_grid = Gtk.Grid(column_spacing=16, row_spacing=4)
+        sc.pack_start(self.preset_grid, False, False, 0)
+        self.preset_note = label("", "dim", wrap=True)
+        sc.pack_start(self.preset_note, False, False, 0)
+        root.pack_start(sc, False, False, 0)
+        cur = self.settings.get("preset") if self.settings.get("preset") in PRESETS else "balanced"
+        self.preset_btns[cur].set_active(True)
+        self.show_preset(cur)
+
         hc = card("Wi-Fi hotspot")
         row = Gtk.Box(spacing=8)
         self.hs_label = label("Off")
@@ -1294,6 +1372,33 @@ class VRControl(Gtk.ApplicationWindow):
         if r:
             self.pair_until = time.time() + 120
             self.pin_label.set_text(r[0])
+
+    def show_preset(self, key):
+        pr = PRESETS[key]
+        self.preset_blurb.set_text(pr["blurb"])
+        for ch in self.preset_grid.get_children():
+            self.preset_grid.remove(ch)
+        for i, (k, v) in enumerate(pr["headset"]):
+            self.preset_grid.attach(label(k, "dim"), 0, i, 1, 1)
+            self.preset_grid.attach(label(v), 1, i, 1, 1)
+        self.preset_grid.show_all()
+        codec = pr["pc"].get("encoder", {}).get("codec", "automatic").upper().replace("H2", "H.2")
+        depth = pr["pc"].get("bit-depth")
+        self.preset_note.set_text(f"PC side (set automatically): codec {codec}"
+                                  + (f", {depth}-bit" if depth else "")
+                                  + ". Takes effect the next time the headset connects.")
+
+    def on_preset(self, btn, key):
+        if not btn.get_active():
+            return
+        try:
+            apply_preset(key)
+        except Exception as e:  # noqa: BLE001
+            self.toast(f"Couldn't save the preset: {e}")
+            return
+        self.settings["preset"] = key
+        save_settings(self.settings)
+        self.show_preset(key)
 
     def on_setting(self, sw, _p, key):
         self.settings[key] = sw.get_active()

@@ -12,6 +12,8 @@ and no SteamVR. One window does the whole thing:
   hotspot devices and Wi-Fi traffic, GPU and video-encoder load (NVIDIA).
 - **Games in the headset**: fills WiVRn's in-headset game list with your installed Steam VR
   games and adds the WiVRn launch options to every one of them, so you never type them in.
+- **Streaming presets**: Latency / Balanced / Quality. Sets the codec and bit depth on the
+  PC and tells you the matching refresh rate, resolution and bitrate to pick in the headset.
 - **Headset audio**: optionally switches sound output and/or mic to the headset while it's
   connected, and back afterwards.
 
@@ -93,6 +95,20 @@ Each time after that: **Start VR** → put the headset on → WiVRn → play →
 | Desktop overlays (WayVR/WlxOverlay-S) on COSMIC with 2+ monitors | The pointer lands in the wrong place (cosmic-comp maps absolute pointer input onto one monitor). Not used by this app. |
 
 Run `vr-control --check` in a terminal for the same checklist as the Setup tab.
+
+## Streaming presets
+
+| Preset | PC (set by the app) | Headset app (WiVRn → Settings) | For |
+|---|---|---|---|
+| Latency | H.264, 8-bit | 120 Hz, resolution scale 1.0, 80 Mbit/s | Beat Saber and other fast games |
+| Balanced (default) | WiVRn default (H.265, 10-bit) | automatic Hz, scale 1.2, 50 Mbit/s | most games |
+| Quality | H.265, 10-bit | 90 Hz, scale 1.4, 100+ Mbit/s | slow games, sightseeing |
+
+On WiVRn 26.9 the PC's `config.json` decides codec and bit depth, while refresh rate,
+resolution and bitrate are stored in the headset app, so those are set by hand. A preset
+takes effect the next time the headset connects. To see the effect, open WiVRn's in-game
+menu (click **both thumbsticks** together) and look at the **Stats** tab, which shows
+encode, network and decode times.
 
 ## How it works
 
