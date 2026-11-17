@@ -582,21 +582,22 @@ PRESETS = {
         blurb="For fast games (Beat Saber, rhythm, shooters). Faster encode/decode and the "
               "highest refresh rate; a bit softer and blockier in fast motion (H.264 needs a higher "
               "bitrate for the same look).",
-        target=dict(hz=120, bitrate=80e6),
-        headset=[("Refresh rate", "120 Hz (highest)"), ("Resolution scale", "1.0"),
+        target=dict(hz=(0, 120), bitrate=80e6),
+        headset=[("Refresh rate", "Automatic (WiVRn picks 120 Hz if the game keeps up) or 120"),
+                 ("Resolution scale", "1.0"),
                  ("Bitrate", "80 Mbit/s")]),
     "balanced": dict(
         label="Balanced", pc={},
         blurb="WiVRn's defaults – good for most VR games.",
-        target=dict(hz=None, bitrate=50e6),
+        target=dict(hz=None, bitrate=50e6),  # any refresh rate is fine
         headset=[("Refresh rate", "Automatic"), ("Resolution scale", "1.2 (default)"),
                  ("Bitrate", "50 Mbit/s (default)")]),
     "quality": dict(
         label="Quality", pc={"encoder": {"encoder": "auto", "codec": "h265"}, "bit-depth": 10},
         blurb="For slow games and sightseeing. Sharpest picture; slightly more delay. High "
               "bitrates need good 5 GHz signal, close to the PC.",
-        target=dict(hz=90, bitrate=100e6, at_least=True),
-        headset=[("Refresh rate", "90 Hz"), ("Resolution scale", "1.4"),
+        target=dict(hz=(0, 90), bitrate=100e6, at_least=True),
+        headset=[("Refresh rate", "Automatic or 90 Hz"), ("Resolution scale", "1.4"),
                  ("Bitrate", "100+ Mbit/s")]),
 }
 
@@ -1460,8 +1461,10 @@ class VRControl(Gtk.ApplicationWindow):
         self.preset_note.set_text(f"PC side (set automatically): codec {codec}"
                                   + (f", {depth}-bit" if depth else "")
                                   + ". Takes effect the next time the headset connects. "
-                                  "WiVRn doesn't let the PC change the headset's settings, so "
-                                  "set the ✘ ones on the headset, then reconnect.")
+                                  "WiVRn 26.9 only lets the headset change refresh rate, bitrate "
+                                  "and resolution, so set the ✘ ones in the headset app, then "
+                                  "reconnect. Leaving refresh rate on Automatic means you only "
+                                  "change bitrate and resolution when you switch preset.")
 
     def update_preset_marks(self, p, conn):
         """Compare the headset's current refresh rate / bitrate with the preset's targets."""
@@ -1473,7 +1476,7 @@ class VRControl(Gtk.ApplicationWindow):
                 set_state(lb, "", "off")
             elif k == "Refresh rate":
                 hz = p.get("PreferredRefreshRate") or 0
-                ok = tg["hz"] is None or abs(hz - tg["hz"]) < 1
+                ok = tg["hz"] is None or any(abs(hz - t) < 1 for t in tg["hz"])
                 set_state(lb, ("✔ " if ok else "✘ ") + (f"now {hz:g} Hz" if hz else "now auto"),
                           "ok" if ok else "bad")
             elif k == "Bitrate":

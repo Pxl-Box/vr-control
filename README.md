@@ -100,13 +100,15 @@ Run `vr-control --check` in a terminal for the same checklist as the Setup tab.
 
 | Preset | PC (set by the app) | Headset app (WiVRn → Settings) | For |
 |---|---|---|---|
-| Latency | H.264, 8-bit | 120 Hz, resolution scale 1.0, 80 Mbit/s | Beat Saber and other fast games |
+| Latency | H.264, 8-bit | Automatic (or 120 Hz), resolution scale 1.0, 80 Mbit/s | Beat Saber and other fast games |
 | Balanced (default) | WiVRn default (H.265, 10-bit) | automatic Hz, scale 1.2, 50 Mbit/s | most games |
-| Quality | H.265, 10-bit | 90 Hz, scale 1.4, 100+ Mbit/s | slow games, sightseeing |
+| Quality | H.265, 10-bit | Automatic (or 90 Hz), scale 1.4, 100+ Mbit/s | slow games, sightseeing |
 
 On WiVRn 26.9 the PC's `config.json` decides codec and bit depth, while refresh rate,
 resolution and bitrate are stored in the headset app, so those are set by hand. A preset
-takes effect the next time the headset connects. To see the effect, open WiVRn's in-game
+takes effect the next time the headset connects. With the headset's refresh rate on **Automatic**, WiVRn picks the
+highest rate the game can sustain (120 Hz for Beat Saber on a decent GPU), so it only needs
+setting once. The preset card marks the headset's current refresh rate and bitrate ✔/✘. To see the effect, open WiVRn's in-game
 menu (click **both thumbsticks** together) and look at the **Stats** tab, which shows
 encode, network and decode times.
 
