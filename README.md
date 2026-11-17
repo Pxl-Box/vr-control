@@ -120,6 +120,21 @@ Also: use 5 GHz, keep the headset in line of sight of the PC, and keep other dev
 hotspot. WiVRn's in-game menu (click **both thumbsticks**) → **Stats** shows encode, network
 and decode times, so you can compare settings.
 
+## No-pause layer (Beat Saber)
+
+Beat Saber pauses whenever the headset takes focus (holding the Meta button to recenter, the
+system menu, the guardian) or its proximity sensor says the headset came off, and afterwards it
+can keep re-pausing every time you resume. `install.sh` adds a tiny OpenXR API layer
+(`nopause-layer/`) that hides those two signals from the game, so it never pauses for them.
+The pause button still works.
+
+- It only acts on games listed in `VRCONTROL_NOPAUSE_APPS` (default `Beat Saber`; `*` = all).
+  Other games pass straight through.
+- Turn it off for a game with the launch option `DISABLE_VRCONTROL_NOPAUSE=1`.
+- What it hid is logged to `~/.local/state/vr-control/nopause-layer.log`.
+- `nopause-layer/test_layer.c` checks its behaviour without a headset
+  (`gcc test_layer.c -ldl && ./a.out`).
+
 ## How it works
 
 - Headset game list: VR games are read from Steam's `appcache/appinfo.vdf` (`openvrsupport`)

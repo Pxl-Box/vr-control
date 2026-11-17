@@ -112,6 +112,31 @@ command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -f -t "${IC
 ok "Installed to $BIN/vr-control (menu entry: VR Control)"
 
 echo
+echo "${b}5. No-pause layer (stops Beat Saber pausing on headset focus loss)${n}"
+LAYER_LIB="$HOME/.local/lib/vr-control/libnopause_layer.so"
+LAYER_JSON="${XDG_DATA_HOME:-$HOME/.local/share}/openxr/1/api_layers/implicit.d/vr-control-nopause.json"
+if command -v gcc >/dev/null; then
+  mkdir -p "$(dirname "$LAYER_LIB")" "$(dirname "$LAYER_JSON")"
+  gcc -O2 -fPIC -shared -fvisibility=hidden -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector -o "$LAYER_LIB" "$HERE/nopause-layer/nopause_layer.c"
+  cat > "$LAYER_JSON" <<EOF
+{
+  "file_format_version": "1.0.0",
+  "api_layer": {
+    "name": "XR_APILAYER_VRCONTROL_no_focus_pause",
+    "library_path": "$LAYER_LIB",
+    "api_version": "1.0",
+    "implementation_version": "1",
+    "description": "Stops listed games (default: Beat Saber) pausing when the headset briefly takes focus or reports being taken off",
+    "disable_environment": "DISABLE_VRCONTROL_NOPAUSE"
+  }
+}
+EOF
+  ok "Installed (games: ${VRCONTROL_NOPAUSE_APPS:-Beat Saber}; turn off per game with DISABLE_VRCONTROL_NOPAUSE=1)"
+else
+  warn "Skipped – needs gcc (build-essential) to build"
+fi
+
+echo
 echo "${b}Setup check${n}"
 "$BIN/vr-control" --check || true
 echo
