@@ -12,8 +12,8 @@ and no SteamVR. One window does the whole thing:
   hotspot devices and Wi-Fi traffic, GPU and video-encoder load (NVIDIA).
 - **Games in the headset**: fills WiVRn's in-headset game list with your installed Steam VR
   games and adds the WiVRn launch options to every one of them, so you never type them in.
-- **Streaming presets**: Latency / Balanced / Quality. Sets the codec and bit depth on the
-  PC and tells you the matching refresh rate, resolution and bitrate to pick in the headset.
+- **Streaming presets**: Latency / Balanced / Quality switch the video codec and bit depth
+  WiVRn uses on the PC.
 - **Headset audio**: optionally switches sound output and/or mic to the headset while it's
   connected, and back afterwards.
 
@@ -96,21 +96,29 @@ Each time after that: **Start VR** → put the headset on → WiVRn → play →
 
 Run `vr-control --check` in a terminal for the same checklist as the Setup tab.
 
-## Streaming presets
+## Streaming presets and latency
 
-| Preset | PC (set by the app) | Headset app (WiVRn → Settings) | For |
-|---|---|---|---|
-| Latency | H.264, 8-bit | Automatic (or 120 Hz), resolution scale 1.0, 80 Mbit/s | Beat Saber and other fast games |
-| Balanced (default) | WiVRn default (H.265, 10-bit) | automatic Hz, scale 1.2, 50 Mbit/s | most games |
-| Quality | H.265, 10-bit | Automatic (or 90 Hz), scale 1.4, 100+ Mbit/s | slow games, sightseeing |
+The preset card changes what the PC controls in WiVRn 26.9: the video codec and bit depth.
+It applies the next time the headset connects.
 
-On WiVRn 26.9 the PC's `config.json` decides codec and bit depth, while refresh rate,
-resolution and bitrate are stored in the headset app, so those are set by hand. A preset
-takes effect the next time the headset connects. With the headset's refresh rate on **Automatic**, WiVRn picks the
-highest rate the game can sustain (120 Hz for Beat Saber on a decent GPU), so it only needs
-setting once. The preset card marks the headset's current refresh rate and bitrate ✔/✘. To see the effect, open WiVRn's in-game
-menu (click **both thumbsticks** together) and look at the **Stats** tab, which shows
-encode, network and decode times.
+| Preset | Codec on the PC | For |
+|---|---|---|
+| Latency | H.264, 8-bit (quickest to encode/decode) | Beat Saber and other fast games |
+| Balanced (default) | WiVRn default: H.265, 10-bit | most games |
+| Quality | H.265, 10-bit, always | slow games, sightseeing |
+
+Refresh rate, resolution and bitrate can only be changed in the **headset app**
+(WiVRn → Settings). For lower latency set:
+
+| Setting | Value | Why |
+|---|---|---|
+| Refresh rate | **Automatic** | WiVRn then picks the highest rate the game sustains (120 Hz on a decent GPU). A new frame every 8 ms instead of 11–14 ms is the biggest win. |
+| Resolution scale | 1.0 (default 1.2) | Less to encode, send and decode per frame. |
+| Bitrate | 60–80 Mbit/s with Latency, 50 otherwise | H.264 needs a bit more for the same look. |
+
+Also: use 5 GHz, keep the headset in line of sight of the PC, and keep other devices off the
+hotspot. WiVRn's in-game menu (click **both thumbsticks**) → **Stats** shows encode, network
+and decode times, so you can compare settings.
 
 ## How it works
 
