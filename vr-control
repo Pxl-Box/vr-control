@@ -883,6 +883,13 @@ def run_checks(settings):
         hs = hs or next(iter(find_hotspots()), None)
         if hs:
             add("VR hotspot", OK, f"Using the “{hs}” hotspot connection.")
+            ps = run(["nmcli", "-g", "802-11-wireless.powersave", "con", "show", hs])[1]
+            if ps != "disable":
+                add("Hotspot power saving", WARN, "Wi-Fi power saving is on for the hotspot, which "
+                    "drops video packets (stutter, extra latency).",
+                    ("action", "Turn it off", "hotspot_powersave"))
+            else:
+                add("Hotspot power saving", OK, "Off – best for streaming.")
         elif dev and wifi_caps(dev)[0]:
             add("VR hotspot", BAD, "Create a private Wi-Fi network for the headset.",
                 ("action", "Create hotspot…", "create_hotspot"))
@@ -1269,6 +1276,13 @@ class VRControl(Gtk.ApplicationWindow):
         if key == "create_hotspot":
             self.create_hotspot()
             return
+        if key == "hotspot_powersave":
+            if self.hotspot:
+                run(["nmcli", "con", "modify", self.hotspot, "802-11-wireless.powersave", "2"])
+                self.toast("Power saving is off. It applies the next time the hotspot starts "
+                           "(Stop VR, then Start VR).")
+            self.refresh_checks()
+            return
         if key == "launch_options":
             btn.set_sensitive(False)
             btn.set_label("Closing Steam and saving…" if steam_running() else "Saving…")
@@ -1326,7 +1340,7 @@ class VRControl(Gtk.ApplicationWindow):
                            "802-11-wireless.band", band, "ipv4.method", "shared",
                            "wifi-sec.key-mgmt", "wpa-psk", "wifi-sec.proto", "rsn",
                            "wifi-sec.pairwise", "ccmp", "wifi-sec.group", "ccmp",
-                           "wifi-sec.psk", pw], timeout=20)
+                           "wifi-sec.psk", pw, "802-11-wireless.powersave", "2"], timeout=20)
             if rc != 0:
                 dlg.err.set_text(f"Couldn't create it: {out}")
                 continue

@@ -34,7 +34,7 @@ Steps:
      nmcli con add type wifi ifname <dev> con-name <name> autoconnect no ssid <name>
        802-11-wireless.mode ap 802-11-wireless.band a ipv4.method shared
        wifi-sec.key-mgmt wpa-psk wifi-sec.proto rsn wifi-sec.pairwise ccmp
-       wifi-sec.group ccmp wifi-sec.psk <password>
+       wifi-sec.group ccmp wifi-sec.psk <password> 802-11-wireless.powersave 2
      (use band bg if 5 GHz isn't supported). Save the name in
      ~/.config/vr-control/settings.json as {"hotspot": "<name>"} (keep any other keys).
      If the card can't do AP mode, explain the router alternative: PC wired to the router,
